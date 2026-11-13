@@ -109,7 +109,14 @@ export default function LiveHudFeed({
         } else if (data.action === 'removed') {
           showToast(`✓ Target ${data.visitor_id} removed from Watchlist`, 'info');
         }
-        if (onDataRefresh) onDataRefresh();
+        if (onDataRefresh) {
+          try {
+            await onDataRefresh();
+          } catch (e) {
+            console.error('Refresh error:', e);
+          }
+        }
+        window.dispatchEvent(new CustomEvent('face-tracker-refresh', { detail: data }));
       } else {
         showToast(data.error || 'No face detected at clicked point', 'warning');
       }

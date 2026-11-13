@@ -26,24 +26,24 @@ export default function TrafficTrendChart({ trendData, activeFilter = 'today', o
   };
 
   const subtitleMap = {
-    today: 'Distinct individuals arriving per hour today (De-duplicated; zero repeat counts)',
-    yesterday: "Distinct individuals across yesterday's operating shifts (De-duplicated)",
-    '7d': 'Daily unique arrivals over the last 7 calendar days (Zero repeat counting)',
-    '30d': '3-day aggregated unique arrivals over past 30 days (Zero repeat counting)'
+    today: 'Distinct individuals entering through Entry Camera (Males + Females, de-duplicated per hour)',
+    yesterday: "Distinct individuals entering through Entry Camera yesterday (Males + Females, de-duplicated)",
+    '7d': 'Daily unique arrivals over the last 7 calendar days (Entry Camera)',
+    '30d': '3-day aggregated unique arrivals over past 30 days (Entry Camera)'
   };
 
   const footerMap = {
-    today: 'Hourly Unique Visitors (Today)',
-    yesterday: 'Hourly Unique Visitors (Yesterday)',
-    '7d': 'Daily Unique Visitors (Past 7 Days)',
-    '30d': '3-Day Aggregated Unique Visitors (Past 30 Days)'
+    today: 'Hourly Unique Entries (Today)',
+    yesterday: 'Hourly Unique Entries (Yesterday)',
+    '7d': 'Daily Unique Entries (Past 7 Days)',
+    '30d': '3-Day Aggregated Unique Entries (Past 30 Days)'
   };
 
   const peakUnitMap = {
-    today: 'unique visitors / hour',
-    yesterday: 'unique visitors / hour',
-    '7d': 'unique visitors / day',
-    '30d': 'unique visitors / 3-day window'
+    today: 'unique entries / hour',
+    yesterday: 'unique entries / hour',
+    '7d': 'unique entries / day',
+    '30d': 'unique entries / 3-day window'
   };
 
   const currentTitle = titleMap[activeFilter] || titleMap.today;
@@ -117,12 +117,35 @@ export default function TrafficTrendChart({ trendData, activeFilter = 'today', o
             >
               {/* Count tooltip */}
               <div style={{
-                fontSize: '11px',
-                fontWeight: '800',
-                color: isPeak ? '#0284c7' : hasCount ? '#0f172a' : '#94a3b8',
-                marginBottom: '6px'
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                marginBottom: '6px',
+                gap: '2px',
+                minHeight: '26px',
+                justifyContent: 'flex-end'
               }}>
-                {item.count}
+                <span style={{
+                  fontSize: '11px',
+                  fontWeight: '800',
+                  color: isPeak ? '#0284c7' : hasCount ? '#0f172a' : '#94a3b8',
+                  lineHeight: 1
+                }}>
+                  {item.count}
+                </span>
+                {hasCount && (item.males !== undefined || item.females !== undefined) && (
+                  <span style={{
+                    fontSize: '9px',
+                    fontWeight: '700',
+                    display: 'flex',
+                    gap: '3px',
+                    whiteSpace: 'nowrap',
+                    lineHeight: 1
+                  }}>
+                    <span style={{ color: '#0284c7' }} title="Males">{item.males || 0}♂</span>
+                    <span style={{ color: '#ec4899' }} title="Females">{item.females || 0}♀</span>
+                  </span>
+                )}
               </div>
 
               {/* Bar */}
@@ -138,7 +161,7 @@ export default function TrafficTrendChart({ trendData, activeFilter = 'today', o
                   transition: 'height 0.3s ease, background-color 0.2s',
                   cursor: 'pointer'
                 }}
-                title={`${item.label}: ${item.count} unique visitors`}
+                title={`${item.label}: ${item.count} Total Entered (${item.males || 0} Males, ${item.females || 0} Females)`}
               />
 
               {/* Label */}
@@ -158,12 +181,20 @@ export default function TrafficTrendChart({ trendData, activeFilter = 'today', o
       </div>
 
       {/* Footer Info */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)' }}>
-        <span>Peak Traffic: <strong style={{ color: '#0284c7' }}>{maxCount > 0 ? `${maxCount} ${currentPeakUnit}` : '0 visitors'}</strong></span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#0284c7' }}></span>
-          {currentFooter}
-        </span>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '12px', fontSize: '11px', color: 'var(--text-muted)', flexWrap: 'wrap', gap: '8px' }}>
+        <span>Peak Traffic: <strong style={{ color: '#0284c7' }}>{maxCount > 0 ? `${maxCount} ${currentPeakUnit}` : '0 entries'}</strong></span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '2px', backgroundColor: '#0284c7' }}></span>
+            <span>{currentFooter}</span>
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#0284c7', fontWeight: '700' }}>
+            <span>♂ Males</span>
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '3px', color: '#ec4899', fontWeight: '700' }}>
+            <span>♀ Females</span>
+          </span>
+        </div>
       </div>
     </div>
   );

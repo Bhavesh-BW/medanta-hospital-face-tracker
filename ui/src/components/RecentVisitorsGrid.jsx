@@ -22,6 +22,7 @@ const formatGridTime = (ts) => {
 export default function RecentVisitorsGrid({
   visitors = [],
   onBlacklist,
+  onRemoveBlacklist,
   onRemoveCrop,
   onMergeProfiles,
   onDeleteProfile,
@@ -79,6 +80,7 @@ export default function RecentVisitorsGrid({
   }, [visitors, gridFrozen, selectedMergeIds.length, similarityWorkspaceOpen, manualMergeModalOpen]);
 
   // Current working list of visitors
+  const blacklistedCount = useMemo(() => (visitors || []).filter(v => v.is_blacklisted).length, [visitors]);
   const activeVisitorsList = (gridFrozen || selectedMergeIds.length > 0 || similarityWorkspaceOpen || manualMergeModalOpen)
     ? (frozenVisitors.length > 0 ? frozenVisitors : visitors)
     : visitors;
@@ -131,6 +133,7 @@ export default function RecentVisitorsGrid({
     if (e) e.stopPropagation();
     const vis = activeVisitorsList.find(v => v.id === visitorId);
     const crops = (Array.isArray(vis?.crops) && vis.crops.length > 0) ? vis.crops : (vis?.photo_b64 ? [vis.photo_b64] : []);
+    const targetCropB64 = (crops && cropIdx < crops.length) ? crops[cropIdx] : null;
 
     if (crops.length <= 1) {
       if (!window.confirm(`This is the only face capture for ${visitorId}. Removing it will delete the entire profile. Proceed?`)) {
@@ -148,7 +151,7 @@ export default function RecentVisitorsGrid({
     }
 
     if (onRemoveCrop) {
-      const ok = await onRemoveCrop(visitorId, cropIdx);
+      const ok = await onRemoveCrop(visitorId, cropIdx, targetCropB64);
       if (ok) {
         setSelectedCropIndex(prev => ({ ...prev, [visitorId]: 0 }));
         showNotice(`Removed crop #${cropIdx + 1} from ${visitorId}`);
@@ -371,7 +374,7 @@ export default function RecentVisitorsGrid({
             <option value="multi">🚶 Multi-Camera Journeys</option>
             <option value="male">♂ Male Only</option>
             <option value="female">♀ Female Only</option>
-            <option value="blacklisted">⚠️ Blacklisted Only</option>
+            <option value="blacklisted">⚠️ Blacklisted Only ({blacklistedCount})</option>
           </select>
 
           {/* Display Limit Dropdown */}
@@ -898,16 +901,41 @@ export default function RecentVisitorsGrid({
                         <span>🚫 Blacklist</span>
                       </button>
                     ) : (
-                      <span style={{
-                        fontSize: '11px',
-                        fontWeight: '800',
-                        color: '#dc2626',
-                        padding: '3px 8px',
-                        backgroundColor: '#fee2e2',
-                        borderRadius: '6px'
-                      }}>
-                        Watchlist Active
-                      </span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{
+                          fontSize: '11px',
+                          fontWeight: '800',
+                          color: '#dc2626',
+                          padding: '3px 8px',
+                          backgroundColor: '#fee2e2',
+                          borderRadius: '6px'
+                        }}>
+                          Watchlist
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (onRemoveBlacklist) {
+                              onRemoveBlacklist(vis.id);
+                              showNotice(`Revoked ${vis.id} from Watchlist`);
+                            }
+                          }}
+                          style={{
+                            padding: '4px 8px',
+                            borderRadius: '6px',
+                            backgroundColor: '#f1f5f9',
+                            color: '#475569',
+                            border: '1px solid #cbd5e1',
+                            fontSize: '11px',
+                            fontWeight: '700',
+                            cursor: 'pointer'
+                          }}
+                          title="Revoke Blacklist"
+                        >
+                          Revoke
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>

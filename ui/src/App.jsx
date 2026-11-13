@@ -52,13 +52,14 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const currentRange = trendRangeRef.current || 'today';
+      const ts = Date.now();
       const [kpiRes, camRes, trendRes, visRes, watchRes, alertRes] = await Promise.all([
-        fetch(`/api/kpis?range=${encodeURIComponent(currentRange)}`).then(r => r.json()).catch(() => null),
-        fetch('/api/cameras').then(r => r.json()).catch(() => null),
-        fetch(`/api/traffic-trend?range=${encodeURIComponent(currentRange)}`).then(r => r.json()).catch(() => null),
-        fetch('/api/visitors?limit=100').then(r => r.json()).catch(() => null),
-        fetch('/api/watchlist').then(r => r.json()).catch(() => null),
-        fetch('/api/alerts').then(r => r.json()).catch(() => null)
+        fetch(`/api/kpis?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/cameras?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/traffic-trend?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/visitors?limit=100&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/watchlist?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/alerts?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null)
       ]);
 
       if (kpiRes) setKpis(kpiRes);
@@ -76,6 +77,69 @@ export default function App() {
       setLoading(false);
     }
   }, []);
+
+  // Listen to instantaneous custom refresh events triggered by feed clicks or manual actions
+  useEffect(() => {
+    const handleInstantRefresh = (e) => {
+      const detail = e?.detail;
+      if (detail && detail.action === 'blacklisted') {
+        const vid = detail.visitor_id;
+        const wid = detail.watchlist_id || `BLK-${Date.now().toString(16).toUpperCase()}`;
+        const name = detail.name || `Target ${vid}`;
+        const reason = detail.alert?.reason || 'Flagged via Live HUD Click';
+        const photo = detail.alert?.photo_b64 || null;
+
+        const newAlert = detail.alert || {
+          id: `ALT-${Date.now().toString(16).toUpperCase()}`,
+          watchlist_id: wid,
+          person_name: name,
+          reason: reason,
+          camera_id: 'main',
+          camera_name: 'Main Porch Entry — Inbound',
+          confidence: 0.99,
+          photo_b64: photo,
+          timestamp: new Date().toISOString(),
+          status: 'open'
+        };
+
+        const newWatchItem = {
+          id: wid,
+          name: name,
+          alias: vid,
+          category: 'visitor',
+          reason: reason,
+          photo_b64: photo,
+          crops: photo ? [photo] : [],
+          enrolled_at: new Date().toISOString()
+        };
+
+        // Optimistically update all 3 lists IMMEDIATELY (0ms delay)
+        setAlerts((prev) => [newAlert, ...(prev || []).filter(a => a.id !== newAlert.id)]);
+        setWatchlist((prev) => [newWatchItem, ...(prev || []).filter(w => w.id !== newWatchItem.id)]);
+        setVisitors((prev) => (prev || []).map(v => 
+          (v.id === vid) ? { ...v, is_blacklisted: true, blacklist_reason: reason } : v
+        ));
+      } else if (detail && detail.action === 'removed') {
+        const vid = detail.visitor_id;
+        const wid = detail.watchlist_id;
+        // Optimistically remove from all 3 lists IMMEDIATELY (0ms delay)
+        setWatchlist((prev) => (prev || []).filter(w => 
+          (!vid || (w.alias !== vid && w.id !== vid)) && 
+          (!wid || (w.id !== wid && w.alias !== wid))
+        ));
+        setAlerts((prev) => (prev || []).filter(a => 
+          (!vid || (a.watchlist_id !== vid && a.person_name !== vid && !String(a.person_name || '').includes(vid))) &&
+          (!wid || (a.watchlist_id !== wid && a.person_name !== wid && !String(a.person_name || '').includes(wid)))
+        ));
+        setVisitors((prev) => (prev || []).map(v => 
+          (v.id === vid || v.id === wid) ? { ...v, is_blacklisted: false, blacklist_reason: null } : v
+        ));
+      }
+      fetchData();
+    };
+    window.addEventListener('face-tracker-refresh', handleInstantRefresh);
+    return () => window.removeEventListener('face-tracker-refresh', handleInstantRefresh);
+  }, [fetchData]);
 
   const dismissedTargetsRef = useRef(new Set());
 
@@ -103,6 +167,7 @@ export default function App() {
 
           console.log("[Threat Alert Event Received]:", alertPayload);
           setActiveAlert(alertPayload);
+          setAlerts(prev => [alertPayload, ...(prev || []).filter(a => a.id !== alertPayload.id)]);
           fetchData();
         } catch (err) {
           console.error("Alert parse error:", err);
@@ -221,24 +286,112 @@ export default function App() {
   };
 
   const handleBlacklist = async (personId, name, reason) => {
-    const res = await fetch('/api/blacklist/add', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ person_id: personId, name, reason })
-    });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error || 'Failed to blacklist');
-    await fetchData();
+    const targetId = String(personId).trim();
+    const targetName = name || targetId;
+    const targetReason = reason || 'Past disturbance at hospital OPD';
+    const tempBlkId = `BLK-${Date.now().toString(16).toUpperCase()}`;
+
+    // 1. Instant Optimistic UI Update (0ms latency!)
+    const currentVis = (visitors || []).find(v => v.id === targetId);
+    const photo = currentVis?.photo_b64 || (currentVis?.crops && currentVis.crops[0]) || null;
+    const crops = currentVis?.crops || (photo ? [photo] : []);
+
+    const newWatchItem = {
+      id: tempBlkId,
+      name: targetName,
+      alias: targetId,
+      category: 'visitor',
+      reason: targetReason,
+      photo_b64: photo,
+      crops: crops,
+      enrolled_at: new Date().toISOString()
+    };
+
+    setWatchlist((prev) => [newWatchItem, ...(prev || []).filter(w => w.id !== tempBlkId && w.alias !== targetId && w.id !== targetId)]);
+    setVisitors((prev) => (prev || []).map(v => 
+      (v.id === targetId) ? { ...v, is_blacklisted: true, blacklist_reason: targetReason } : v
+    ));
+
+    window.dispatchEvent(new CustomEvent('face-tracker-refresh', {
+      detail: {
+        action: 'blacklisted',
+        visitor_id: targetId,
+        watchlist_id: tempBlkId,
+        name: targetName,
+        alert: {
+          id: `ALT-${Date.now().toString(16).toUpperCase()}`,
+          watchlist_id: tempBlkId,
+          person_name: targetName,
+          reason: targetReason,
+          camera_id: 'MANUAL',
+          camera_name: 'Watchlist Enrolled',
+          confidence: 1.0,
+          photo_b64: photo,
+          timestamp: 'Just now'
+        }
+      }
+    }));
+
+    try {
+      const res = await fetch('/api/blacklist/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ person_id: targetId, name: targetName, reason: targetReason })
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'Failed to blacklist');
+      if (json.watchlist) {
+        setWatchlist(json.watchlist);
+      }
+      await fetchData();
+    } catch (err) {
+      console.error("Blacklist add error:", err);
+      await fetchData();
+    }
   };
 
-  const handleRemoveBlacklist = async (wid) => {
-    if (!window.confirm("Revoke blacklist status for this person?")) return;
-    const res = await fetch('/api/blacklist/remove', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ watchlist_id: wid })
-    });
-    if (res.ok) {
+  const handleRemoveBlacklist = async (itemOrId) => {
+    const wid = (typeof itemOrId === 'object' && itemOrId !== null) ? itemOrId.id : itemOrId;
+    const alias = (typeof itemOrId === 'object' && itemOrId !== null) ? itemOrId.alias : null;
+    const name = (typeof itemOrId === 'object' && itemOrId !== null) ? itemOrId.name : null;
+
+    const targetIds = new Set([String(wid).trim()]);
+    if (alias) targetIds.add(String(alias).trim());
+
+    // 1. INSTANT OPTIMISTIC REMOVAL (0ms delay): remove from UI immediately
+    setWatchlist((prev) => (prev || []).filter(w => 
+      !targetIds.has(w.id) && !targetIds.has(w.alias) && (!name || w.name !== name)
+    ));
+    setAlerts((prev) => (prev || []).filter(a => 
+      !targetIds.has(a.watchlist_id) && 
+      (!alias || (a.watchlist_id !== alias && a.person_name !== alias && !String(a.person_name || '').includes(alias)))
+    ));
+    setVisitors((prev) => (prev || []).map(v => 
+      (targetIds.has(v.id) || (alias && v.id === alias) || v.id === wid) ? { ...v, is_blacklisted: false, blacklist_reason: null } : v
+    ));
+
+    // 2. Dispatch custom event so any other components update immediately
+    window.dispatchEvent(new CustomEvent('face-tracker-refresh', {
+      detail: {
+        action: 'removed',
+        visitor_id: alias || wid,
+        watchlist_id: wid
+      }
+    }));
+
+    // 3. Send API request in background (non-blocking)
+    try {
+      const res = await fetch('/api/blacklist/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ watchlist_id: wid, alias: alias, name: name })
+      });
+      const data = await res.json().catch(() => null);
+      if (data && data.watchlist) {
+        setWatchlist(data.watchlist);
+      }
+    } catch (err) {
+      console.error("Failed to remove from blacklist:", err);
       fetchData();
     }
   };
@@ -254,12 +407,12 @@ export default function App() {
     await fetchData();
   };
 
-  const handleRemoveCrop = async (visitorId, cropIndex) => {
+  const handleRemoveCrop = async (visitorId, cropIndex, cropB64 = null) => {
     try {
       const res = await fetch('/api/visitors/remove-crop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ visitor_id: visitorId, crop_index: cropIndex })
+        body: JSON.stringify({ visitor_id: visitorId, crop_index: cropIndex, crop_b64: cropB64 })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to remove crop');
@@ -580,6 +733,7 @@ export default function App() {
       <RecentVisitorsGrid
         visitors={visitors}
         onBlacklist={handleBlacklist}
+        onRemoveBlacklist={handleRemoveBlacklist}
         onRemoveCrop={handleRemoveCrop}
         onMergeProfiles={handleMergeProfiles}
         onDeleteProfile={handleDeleteProfile}

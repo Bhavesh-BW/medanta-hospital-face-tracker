@@ -58,8 +58,10 @@ export default function BlacklistSecurityHub({ watchlist, alerts, onRemoveBlackl
     return (watchlist || []).filter(item => 
       (item.name || '').toLowerCase().includes(search.toLowerCase()) ||
       (item.blacklist_reason || '').toLowerCase().includes(search.toLowerCase()) ||
+      (item.reason || '').toLowerCase().includes(search.toLowerCase()) ||
       (item.person_id || '').toLowerCase().includes(search.toLowerCase()) ||
-      (item.alias || '').toLowerCase().includes(search.toLowerCase())
+      (item.alias || '').toLowerCase().includes(search.toLowerCase()) ||
+      (item.id || '').toLowerCase().includes(search.toLowerCase())
     );
   }, [watchlist, search]);
 
@@ -636,7 +638,7 @@ export default function BlacklistSecurityHub({ watchlist, alerts, onRemoveBlackl
                         </span>
                       </td>
                       <td style={{ padding: '12px 14px', color: '#991b1b', fontWeight: '500' }}>
-                        {item.blacklist_reason || 'Security threat / Banned'}
+                        {item.reason || item.blacklist_reason || 'Security threat / Banned'}
                       </td>
                       <td style={{ padding: '12px 14px', fontFamily: 'var(--font-mono)', color: 'var(--text-dim)' }}>
                         {item.enrolled_at ? item.enrolled_at.slice(0, 10) : '2026-11-11'}
@@ -644,7 +646,7 @@ export default function BlacklistSecurityHub({ watchlist, alerts, onRemoveBlackl
                       <td style={{ padding: '12px 14px', textAlign: 'right' }}>
                         <button
                           type="button"
-                          onClick={() => onRemoveBlacklist(item.id)}
+                          onClick={() => onRemoveBlacklist(item)}
                           style={{
                             padding: '4px 10px',
                             borderRadius: '6px',
