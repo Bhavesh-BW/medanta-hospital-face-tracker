@@ -484,9 +484,10 @@ export default function RecentVisitorsGrid({
             const isFemale = vis.gender === 'female';
             const isSelected = selectedMergeIds.includes(vis.id);
             const crops = (Array.isArray(vis.crops) && vis.crops.length > 0) ? vis.crops : (vis.photo_b64 ? [vis.photo_b64] : []);
-            const activeIdx = selectedCropIndex[vis.id] !== undefined ? selectedCropIndex[vis.id] : 0;
-            const safeIdx = (activeIdx >= 0 && activeIdx < crops.length) ? activeIdx : 0;
-            const activePhoto = crops[safeIdx] || vis.photo_b64;
+            const activeIdx = selectedCropIndex[vis.id];
+            const hasCustomSelection = activeIdx !== undefined && activeIdx >= 0 && activeIdx < crops.length;
+            const safeIdx = hasCustomSelection ? activeIdx : 0;
+            const activePhoto = hasCustomSelection ? crops[activeIdx] : (vis.photo_b64 || crops[0]);
 
             // Distinctive Card Styling: Red for Blacklist, Pink for Female, Blue for Male
             let cardBorder = '2px solid #38bdf8'; // Blue (Male)
@@ -685,53 +686,107 @@ export default function RecentVisitorsGrid({
 
                   {/* Main Preview Face Crop + Multi-Crop Filmstrip */}
                   <div style={{ display: 'flex', gap: '14px', alignItems: 'flex-start' }}>
-                    {/* Primary Large Photo */}
+                    {/* Primary Large Photo (Body/Outfit View by default, or Selected Facial Crop) */}
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
-                      <div style={{
-                        width: '84px',
-                        height: '84px',
-                        borderRadius: '10px',
-                        backgroundColor: '#e2e8f0',
-                        overflow: 'hidden',
-                        flexShrink: 0,
-                        border: photoBorder,
-                        boxShadow: '0 2px 4px rgba(0,0,0,0.08)'
-                      }}>
+                      <div
+                        onClick={() => {
+                          if (hasCustomSelection) {
+                            setSelectedCropIndex(prev => ({ ...prev, [vis.id]: undefined }));
+                          }
+                        }}
+                        title={hasCustomSelection ? "Viewing facial crop — Click to return to Outfit view" : "Upper-body & Outfit view — Click any thumbnail on the right to inspect facial crop"}
+                        style={{
+                          width: '90px',
+                          height: '110px',
+                          borderRadius: '10px',
+                          backgroundColor: '#e2e8f0',
+                          overflow: 'hidden',
+                          flexShrink: 0,
+                          border: hasCustomSelection ? '2px solid #0284c7' : photoBorder,
+                          boxShadow: '0 2px 4px rgba(0,0,0,0.08)',
+                          position: 'relative',
+                          cursor: hasCustomSelection ? 'pointer' : 'default'
+                        }}
+                      >
                         {activePhoto ? (
                           <img
                             src={activePhoto}
                             alt={vis.id}
-                            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              objectFit: 'cover',
+                              objectPosition: 'top center'
+                            }}
                           />
                         ) : (
                           <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px' }}>
                             👤
                           </div>
                         )}
+                        <div style={{
+                          position: 'absolute',
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          background: hasCustomSelection ? 'rgba(2,132,199,0.85)' : 'rgba(15,23,42,0.65)',
+                          color: '#ffffff',
+                          fontSize: '9px',
+                          fontWeight: '700',
+                          padding: '2px 4px',
+                          textAlign: 'center',
+                          backdropFilter: 'blur(2px)'
+                        }}>
+                          {hasCustomSelection ? `Face #${safeIdx + 1}` : 'Outfit / Torso'}
+                        </div>
                       </div>
 
                       {/* 1-Click Delete Active Crop */}
-                      <button
-                        type="button"
-                        onClick={(e) => handleRemoveSingleCrop(vis.id, safeIdx, e)}
-                        title="Remove this specific face crop (bad angle or Person B)"
-                        style={{
-                          background: '#fee2e2',
-                          border: '1px solid #fecdd3',
-                          color: '#b91c1c',
-                          borderRadius: '6px',
-                          padding: '2px 6px',
-                          fontSize: '10px',
-                          fontWeight: '700',
-                          cursor: 'pointer',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '3px'
-                        }}
-                      >
-                        <span>✕</span>
-                        <span>Del Crop #{safeIdx + 1}</span>
-                      </button>
+                      {hasCustomSelection ? (
+                        <button
+                          type="button"
+                          onClick={(e) => handleRemoveSingleCrop(vis.id, safeIdx, e)}
+                          title="Remove this specific facial crop (bad angle or Person B)"
+                          style={{
+                            background: '#fee2e2',
+                            border: '1px solid #fecdd3',
+                            color: '#b91c1c',
+                            borderRadius: '6px',
+                            padding: '2px 6px',
+                            fontSize: '10px',
+                            fontWeight: '700',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px'
+                          }}
+                        >
+                          <span>✕</span>
+                          <span>Del Crop #{safeIdx + 1}</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={(e) => handleRemoveSingleCrop(vis.id, 0, e)}
+                          title="Remove primary facial capture"
+                          style={{
+                            background: '#f8fafc',
+                            border: '1px solid #cbd5e1',
+                            color: '#64748b',
+                            borderRadius: '6px',
+                            padding: '2px 6px',
+                            fontSize: '10px',
+                            fontWeight: '600',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px'
+                          }}
+                        >
+                          <span>✕</span>
+                          <span>Del Crop #1</span>
+                        </button>
+                      )}
                     </div>
 
                     {/* Right side: Grouped crops list with hover ✕ delete badges */}
@@ -746,56 +801,68 @@ export default function RecentVisitorsGrid({
                       </div>
 
                       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                        {crops.map((cropImg, cIdx) => (
-                          <div
-                            key={cIdx}
-                            onClick={(e) => handleSelectCrop(vis.id, cIdx, e)}
-                            title={`Angle #${cIdx + 1} (Click to preview, ✕ to delete)`}
-                            style={{
-                              position: 'relative',
-                              width: '36px',
-                              height: '36px',
-                              borderRadius: '6px',
-                              cursor: 'pointer',
-                              border: safeIdx === cIdx ? '2px solid #0284c7' : '1px solid #cbd5e1',
-                              transform: safeIdx === cIdx ? 'scale(1.06)' : 'scale(1)',
-                              transition: 'all 0.15s ease',
-                              backgroundColor: '#f1f5f9'
-                            }}
-                          >
-                            <img
-                              src={cropImg}
-                              alt={`Angle ${cIdx + 1}`}
-                              style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '4px' }}
-                            />
-
-                            {/* Direct Delete Badge on Thumbnail */}
+                        {crops.map((cropImg, cIdx) => {
+                          const isCropActive = hasCustomSelection && safeIdx === cIdx;
+                          return (
                             <div
-                              onClick={(e) => handleRemoveSingleCrop(vis.id, cIdx, e)}
-                              title="Delete this crop"
+                              key={cIdx}
+                              onClick={(e) => {
+                                if (e) e.stopPropagation();
+                                if (hasCustomSelection && activeIdx === cIdx) {
+                                  setSelectedCropIndex(prev => ({ ...prev, [vis.id]: undefined }));
+                                } else {
+                                  setSelectedCropIndex(prev => ({ ...prev, [vis.id]: cIdx }));
+                                }
+                              }}
+                              title={`Face Angle #${cIdx + 1} (Click to preview, ✕ to delete)`}
                               style={{
-                                position: 'absolute',
-                                top: '-4px',
-                                right: '-4px',
-                                width: '15px',
-                                height: '15px',
-                                borderRadius: '50%',
-                                backgroundColor: '#ef4444',
-                                color: '#ffffff',
-                                fontSize: '9px',
-                                fontWeight: '900',
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                                position: 'relative',
+                                width: '36px',
+                                height: '36px',
+                                borderRadius: '6px',
                                 cursor: 'pointer',
-                                zIndex: 2
+                                border: isCropActive ? '2px solid #0284c7' : '1px solid #cbd5e1',
+                                transform: isCropActive ? 'scale(1.08)' : 'scale(1)',
+                                transition: 'all 0.15s ease',
+                                backgroundColor: '#f1f5f9'
                               }}
                             >
-                              ✕
+                              <img
+                                src={cropImg}
+                                alt={`Angle ${cIdx + 1}`}
+                                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '4px' }}
+                              />
+
+                              {/* Direct Delete Badge on Thumbnail */}
+                              <div
+                                onClick={(e) => {
+                                  if (e) e.stopPropagation();
+                                  handleRemoveSingleCrop(vis.id, cIdx, e);
+                                }}
+                                title="Delete this crop"
+                                style={{
+                                  position: 'absolute',
+                                  top: '-4px',
+                                  right: '-4px',
+                                  width: '15px',
+                                  height: '15px',
+                                  borderRadius: '50%',
+                                  backgroundColor: '#ef4444',
+                                  color: 'white',
+                                  fontSize: '10px',
+                                  fontWeight: '900',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                                  zIndex: 2
+                                }}
+                              >
+                                ✕
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   </div>

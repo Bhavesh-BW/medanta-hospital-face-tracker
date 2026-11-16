@@ -477,11 +477,12 @@ class CameraStreamPipeline:
 
     def _capture_loop(self):
         t0 = time.time()
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
         while self.running:
             gen = self.generation
             cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG, [
-                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
-                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000
             ])
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -507,9 +508,17 @@ class CameraStreamPipeline:
                 self.is_rtsp_connected = True
                 self.error_msg = None
 
+            is_file = os.path.isfile(self.rtsp_url)
+            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_delay = 1.0 / max(10.0, min(60.0, video_fps)) if is_file else 0.0
+
             while self.running and self.generation == gen:
                 ok, frame = cap.read()
                 if not ok:
+                    if is_file:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        time.sleep(0.1)
+                        continue
                     with self.lock:
                         self.is_rtsp_connected = False
                     break
@@ -517,6 +526,8 @@ class CameraStreamPipeline:
                     self.is_rtsp_connected = True
                     self.latest_frame = frame
                     self.lock.notify_all()
+                if is_file and frame_delay > 0:
+                    time.sleep(frame_delay)
 
             cap.release()
             time.sleep(0.5)
@@ -561,16 +572,31 @@ class CameraStreamPipeline:
 
         matched_track_ids = set()
 
+        is_exit_camera = (getattr(self, 'role', 'entry') == 'exit') or ('exit' in self.camera_id.lower()) or ('exit' in self.name.lower())
+
         for face in faces:
             x, y, w, h = [int(v) for v in face[:4]]
             det_score = float(face[-1])
-            if det_score < 0.70 or w < 32 or h < 36:
+            min_det = 0.74 if is_exit_camera else 0.70
+            if det_score < min_det or w < 32 or h < 36:
                 continue
+
+            # False Positive Filter 1: Exit camera sitting guard lap/knees/hands exclusion
+            if is_exit_camera and x > 1200 and y > 650:
+                continue
+
+            # False Positive Filter 2: Anatomical 5-point landmark geometry (rejects hands, cuffs, buttons, clothing folds)
+            if len(face) >= 8 and face[4] > 0 and face[6] > 0:
+                re_x, re_y = face[4], face[5]
+                le_x, le_y = face[6], face[7]
+                eye_dist = math.hypot(le_x - re_x, le_y - re_y)
+                if (eye_dist / max(w, 1)) < 0.15:
+                    continue
 
             cx = x + w / 2.0
             cy = y + h / 2.0
 
-            # Crop face thumbnail
+            # Crop face thumbnail (tight facial crop for biometrics & gallery filmstrip)
             H_f, W_f = frame.shape[:2]
             y1 = max(0, y)
             y2 = min(H_f, y + h)
@@ -578,18 +604,45 @@ class CameraStreamPipeline:
             x2 = min(W_f, x + w)
             face_crop = frame[y1:y2, x1:x2] if y2 > y1 and x2 > x1 else None
 
+            # False Positive Filter 3: Dark clothing / trousers contrast check
+            # Hands resting on black trousers have >42% pitch-black pixels. Real faces have <5%.
+            if face_crop is not None and face_crop.size > 0:
+                hsv_v = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)[:, :, 2]
+                if np.mean(hsv_v < 40) > 0.42:
+                    continue
+
             # Assess frontality & sharpness for crop saving / enrollment (used downstream)
             is_sharp, quality_score = self.engine._is_sharp_face_crop(face_crop, face, det_score)
 
-            photo_b64 = ""
+            face_b64 = ""
             if face_crop is not None and face_crop.size > 0:
                 ok, buf = cv2.imencode('.jpg', face_crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
                 if ok:
-                    photo_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+                    face_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+
+            # Expanded Upper Body / Torso crop for realistic outfit/person identification on visitor card
+            pad_x = int(w * 0.90)
+            pad_top = int(h * 0.30)
+            pad_bot = int(h * 2.80)
+            bx1 = max(0, x - pad_x)
+            bx2 = min(W_f, x + w + pad_x)
+            by1 = max(0, y - pad_top)
+            by2 = min(H_f, y + h + pad_bot)
+            body_crop = frame[by1:by2, bx1:bx2] if by2 > by1 and bx2 > bx1 else face_crop
+
+            body_b64 = ""
+            if body_crop is not None and body_crop.size > 0:
+                ok, buf = cv2.imencode('.jpg', body_crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ok:
+                    body_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf.tobytes()).decode()}"
+            if not body_b64:
+                body_b64 = face_b64
+
+            photo_b64 = body_b64
 
             # Extract embedding & gender/age
             emb = self.engine._extract_embedding(frame, face)
-            instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id)
+            instant_gender, gender_conf, age = self.engine._estimate_gender_and_age(frame, face, face_crop, self.camera_id, body_crop)
 
             # Spatial track association
             best_track_id = None
@@ -671,7 +724,10 @@ class CameraStreamPipeline:
 
             # Priority C: Vector Matrix Search (<0.3ms across thousands of faces)
             if matched_visitor is None:
-                matched_visitor, max_vis_sim = self.engine.search_gallery(emb, threshold=0.50, recent_threshold=0.44)
+                matched_visitor, max_vis_sim = self.engine.search_gallery(
+                    emb, threshold=0.52, recent_threshold=0.48,
+                    query_gender=instant_gender, gender_conf=gender_conf
+                )
                 # Secondary verification: confirm match against stored embeddings of this visitor
                 if matched_visitor is not None:
                     vis_embs = matched_visitor.get('embeddings', [matched_visitor.get('embedding')])
@@ -705,12 +761,12 @@ class CameraStreamPipeline:
                     else:
                         visitor_id = f"VIS-{uuid.uuid4().hex[:8].upper()}"
 
-                    init_gender = instant_gender or 'female'
+                    init_gender = instant_gender or 'male'
                     init_conf = gender_conf if instant_gender else 0.70
                     self.engine.gender_votes[visitor_id] = collections.deque([(init_gender, init_conf)], maxlen=30)
                     gender = init_gender
                     gender_locked_flag = False
-                    crops_list = [photo_b64] if photo_b64 else []
+                    crops_list = [face_b64] if face_b64 else ([photo_b64] if photo_b64 else [])
 
                     matched_visitor = {
                         'id': visitor_id,
@@ -822,10 +878,10 @@ class CameraStreamPipeline:
                 # Once gender_locked=True (by user OR auto), it is NEVER overwritten by votes again
                 if visitor_id in self.engine.locked_genders or matched_visitor.get('gender_locked'):
                     # LOCKED: respect the stored gender unconditionally — no vote processing at all
-                    consensus_gender = matched_visitor.get('gender', 'female')
+                    consensus_gender = matched_visitor.get('gender', 'male')
                 else:
                     if visitor_id not in self.engine.gender_votes:
-                        self.engine.gender_votes[visitor_id] = collections.deque([(matched_visitor.get('gender', instant_gender or 'female'), 0.85)], maxlen=30)
+                        self.engine.gender_votes[visitor_id] = collections.deque([(matched_visitor.get('gender', instant_gender or 'male'), 0.85)], maxlen=30)
                     if instant_gender is not None and gender_conf >= 0.50:
                         self.engine.gender_votes[visitor_id].append((instant_gender, gender_conf))
 
@@ -869,15 +925,18 @@ class CameraStreamPipeline:
                     existing_quality = matched_visitor.get('best_quality', 0.0)
 
                     if photo_b64 and is_sharp and quality_score >= 30.0 and det_score >= 0.75:
+                        current_photo = matched_visitor.get('photo_b64', '')
+                        is_old_face_only = len(current_photo) < 9000
                         # If profile already has 8 crops or is locked, stop adding/replacing crops aggressively!
-                        if len(crops) >= 8 or matched_visitor.get('gender_locked'):
+                        if (len(crops) >= 8 or matched_visitor.get('gender_locked')) and not is_old_face_only:
                             pass  # Crops and embeddings are fully stabilized. Do not add more!
-                        elif quality_score > existing_quality or not matched_visitor.get('photo_b64'):
-                            matched_visitor['photo_b64'] = photo_b64
+                        elif is_old_face_only or quality_score > existing_quality or not matched_visitor.get('photo_b64'):
+                            matched_visitor['photo_b64'] = photo_b64  # Upper body / torso photo
                             matched_visitor['best_quality'] = quality_score
-                            if photo_b64 in crops:
-                                crops.remove(photo_b64)
-                            crops.insert(0, photo_b64)
+                            if face_b64 and face_b64 in crops:
+                                crops.remove(face_b64)
+                            if face_b64:
+                                crops.insert(0, face_b64)
                             matched_visitor['crops'] = crops[:8]
                             matched_visitor['embedding'] = emb
                             if 'embeddings' not in matched_visitor or not matched_visitor['embeddings']:
@@ -899,7 +958,10 @@ class CameraStreamPipeline:
                             # CAP: Max 5 embeddings per visitor in gallery matrix (crops can still reach 8)
                             gallery_emb_count = len([e for e in vis_embs if e is not None])
                             if crop_cooldown_ok and 0.60 <= max_sim <= 0.88 and gallery_emb_count < 5:
-                                crops.append(photo_b64)
+                                if face_b64:
+                                    crops.append(face_b64)
+                                else:
+                                    crops.append(photo_b64)
                                 matched_visitor['crops'] = crops[:8]
                                 if 'embeddings' not in matched_visitor or not matched_visitor['embeddings']:
                                     matched_visitor['embeddings'] = [emb]
@@ -1396,7 +1458,7 @@ class FaceTrackerEngine:
         except Exception:
             return False, 0.0
 
-    def _estimate_gender_and_age(self, frame: np.ndarray, face: np.ndarray, face_crop: np.ndarray, camera_id: str):
+    def _estimate_gender_and_age(self, frame: np.ndarray, face: np.ndarray, face_crop: np.ndarray, camera_id: str, body_crop: np.ndarray = None):
         if self.gender_net is not None:
             try:
                 x, y, w, h = [int(v) for v in face[:4]]
@@ -1404,60 +1466,86 @@ class FaceTrackerEngine:
                     return None, 0.0, 30
 
                 H, W = frame.shape[:2]
+                # Direct face crop (zero margin padding):
+                fc = frame[max(0, y):min(H, y + h), max(0, x):min(W, x + w)]
+                if fc is None or fc.size == 0:
+                    fc = face_crop
+                if fc is None or fc.size == 0:
+                    return None, 0.0, 30
 
-                if len(face) >= 8 and face[4] > 0 and face[6] > 0:
-                    re_x, re_y = face[4], face[5]
-                    le_x, le_y = face[6], face[7]
-                    dx = le_x - re_x
-                    dy = le_y - re_y
-                    angle = float(np.degrees(np.arctan2(dy, dx)))
-                    center = (float(x + w / 2), float(y + h / 2))
-                    scale = 96.0 / (max(w, h, 28) * 1.45)
-                    M = cv2.getRotationMatrix2D(center, angle, scale)
-                    M[0, 2] += (48.0 - center[0])
-                    M[1, 2] += (48.0 - center[1])
-                    aligned = cv2.warpAffine(frame, M, (96, 96), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                def _eval_net(img_crop):
+                    if img_crop is None or img_crop.size == 0:
+                        return 0.5, 0.5, 30
+                    blob = cv2.dnn.blobFromImage(cv2.resize(img_crop, (96, 96)), 1.0, (96, 96), (0, 0, 0), swapRB=True)
+                    with self.inference_lock:
+                        self.gender_net.setInput(blob)
+                        preds = self.gender_net.forward()
+                    if isinstance(preds, (list, tuple)) and len(preds) >= 2:
+                        gender_preds, age_preds = preds[0], preds[1]
+                    else:
+                        gender_preds = preds[:, :2]
+                        age_preds = preds[:, 2] if preds.shape[1] > 2 else [[30]]
+                    exp_g = np.exp(gender_preds[0] - np.max(gender_preds[0]))
+                    probs = exp_g / np.sum(exp_g)
+                    age_val = int(round(float(age_preds[0][0]) * 100)) if hasattr(age_preds[0], '__len__') else int(round(float(age_preds[0]) * 100))
+                    age_val = max(18, min(80, age_val))
+                    return float(probs[0]), float(probs[1]), age_val
+
+                # 1. Face crop evaluation
+                f_face, m_face, a_face = _eval_net(fc)
+
+                # 2. Head / Hair crop evaluation (silhouette, haircut, ears, sideburns, neck)
+                head_crop = None
+                if body_crop is not None and body_crop.size > 0:
+                    head_crop = body_crop[0:int(body_crop.shape[0] * 0.48), :]
                 else:
-                    margin_x = int(w * 0.25)
-                    margin_y = int(h * 0.25)
-                    y1 = max(0, y - margin_y)
-                    y2 = min(H, y + h + margin_y)
-                    x1 = max(0, x - margin_x)
-                    x2 = min(W, x + w + margin_x)
-                    crop_area = frame[y1:y2, x1:x2]
-                    if crop_area is None or crop_area.size == 0:
-                        crop_area = face_crop
-                    aligned = cv2.resize(crop_area, (96, 96))
+                    pad_side = int(w * 0.40)
+                    pad_top = int(h * 0.25)
+                    pad_bot = int(h * 0.70)
+                    head_crop = frame[max(0, y - pad_top):min(H, y + h + pad_bot), max(0, x - pad_side):min(W, x + w + pad_side)]
 
-                blob = cv2.dnn.blobFromImage(aligned, 1.0, (96, 96), (0, 0, 0), swapRB=True)
-                with self.inference_lock:
-                    self.gender_net.setInput(blob)
-                    preds = self.gender_net.forward()
-                
-                if isinstance(preds, (list, tuple)) and len(preds) >= 2:
-                    gender_preds, age_preds = preds[0], preds[1]
+                f_head, m_head, a_head = _eval_net(head_crop)
+
+                # 3. Detect surgical mask / medical face covering on lower half of face
+                mask_r = 0.0
+                if fc is not None and fc.size > 0:
+                    h_fc = fc.shape[0]
+                    lower = fc[int(h_fc * 0.5):, :]
+                    hsv = cv2.cvtColor(lower, cv2.COLOR_BGR2HSV)
+                    mask_r = np.count_nonzero((hsv[:, :, 1] < 38) & (hsv[:, :, 2] > 140)) / max(1, lower.shape[0] * lower.shape[1])
+
+                is_masked = (mask_r >= 0.22)
+                if is_masked:
+                    # In hospital CCTV, surgical masks occlude mouth/chin leading face models to default to male.
+                    # Head/hair features (long hair over shoulders, ponytail, female silhouette) give definitive truth (>95%).
+                    gender = 'female' if f_head >= 0.45 else 'male'
+                    conf = max(f_head, 0.75) if gender == 'female' else max(m_head, 0.75)
+                    age = a_head
                 else:
-                    gender_preds = preds[:, :2]
-                    age_preds = preds[:, 2] if preds.shape[1] > 2 else [[30]]
+                    # When unmasked:
+                    hsv_fc = cv2.cvtColor(fc, cv2.COLOR_BGR2HSV)
+                    mean_v = float(np.mean(hsv_fc[:, :, 2]))
 
-                exp_g = np.exp(gender_preds[0] - np.max(gender_preds[0]))
-                probs = exp_g / np.sum(exp_g)
-                female_prob = float(probs[0])
-                male_prob = float(probs[1])
+                    # Severe shadow under cap (e.g. VIS-207CB4A9): mean_v < 65 and head shows strong male (f_head < 0.22)
+                    if mean_v < 65 and f_head < 0.22 and f_face >= 0.50:
+                        gender = 'male'
+                        conf = max(m_head, 0.75)
+                        age = a_head
+                    elif f_face >= 0.55:
+                        gender = 'female'
+                        conf = f_face
+                        age = a_face
+                    elif m_face >= 0.55:
+                        gender = 'male'
+                        conf = m_face
+                        age = a_face
+                    else:
+                        comb_f = 0.60 * f_face + 0.40 * f_head
+                        gender = 'female' if comb_f >= 0.50 else 'male'
+                        conf = comb_f if gender == 'female' else (1.0 - comb_f)
+                        age = a_face
 
-                age = int(round(float(age_preds[0][0]) * 100)) if hasattr(age_preds[0], '__len__') else int(round(float(age_preds[0]) * 100))
-                age = max(18, min(80, age))
-
-                # InsightFace genderage model: index 0 = Female, index 1 = Male
-                # Distant / top-down CCTV cameras naturally bias toward Male due to forehead lighting/shadows.
-                # To counteract this false-male skew on entry, require Male to have clear margin (> 0.68)
-                # or Female probability >= 0.35
-                if female_prob >= 0.35:
-                    return 'female', max(female_prob, 0.65), age
-                elif male_prob >= 0.68:
-                    return 'male', male_prob, age
-                else:
-                    return ('female' if female_prob >= 0.35 else 'male'), max(female_prob, male_prob), age
+                return gender, conf, age
             except Exception:
                 pass
 
@@ -1556,7 +1644,7 @@ class FaceTrackerEngine:
 
             if emb is not None:
                 vis_embeddings = [emb]
-                if is_blk or is_locked:
+                if is_blk:
                     for c_img in crops[:6]:
                         c_emb = self._extract_crop_embedding(c_img)
                         if c_emb is not None:
@@ -1743,7 +1831,7 @@ class FaceTrackerEngine:
                 self.watchlist_matrix = None
                 self.watchlist_index = []
 
-    def search_gallery(self, emb: np.ndarray, threshold: float = 0.50, recent_threshold: float = 0.44, recent_seconds: float = 900.0):
+    def search_gallery(self, emb: np.ndarray, threshold: float = 0.52, recent_threshold: float = 0.48, recent_seconds: float = 900.0, query_gender: str = None, gender_conf: float = 0.0):
         with self.matrix_lock:
             if self.gallery_matrix is None or len(self.gallery_index) == 0:
                 return None, 0.0
@@ -1759,23 +1847,39 @@ class FaceTrackerEngine:
             now_epoch = time.time()
             top_k_indices = np.argsort(sims)[::-1][:15]
 
-            # 1. Temporal Corridor Priority: If seen nearby in recent_seconds (15 mins), match with relaxed threshold (0.45)
+            # 1. Temporal Corridor Priority: If seen nearby in recent_seconds (15 mins), match with corridor threshold (0.48)
             # This ensures walking visitors maintain continuous identity and do not fragment into multiple IDs
             for idx in top_k_indices:
                 sim = float(sims[idx])
                 if sim < recent_threshold:
                     break
                 vis = self.gallery_index[idx]
+
+                # Gender Consistency Guard:
+                # If query is confident (gender_conf >= 0.70) and candidate visitor has an established/locked gender
+                # that contradicts the query, do NOT match! (Prevents walking males from merging into female guard)
+                cand_gender = vis.get('gender')
+                if query_gender and cand_gender and gender_conf >= 0.70:
+                    if cand_gender != query_gender and (vis.get('gender_locked') or vis.get('gender_confidence', 0) >= 0.75):
+                        continue
+
                 last_seen_epoch = vis.get('last_seen_epoch', 0)
                 if (now_epoch - last_seen_epoch) <= recent_seconds:
                     return vis, sim
 
             # 2. General Historical Gallery Match: Requires strict threshold (0.52)
-            best_idx = int(top_k_indices[0])
-            best_sim = float(sims[best_idx])
-            if best_sim >= threshold:
-                return self.gallery_index[best_idx], best_sim
-            return None, best_sim
+            for idx in top_k_indices:
+                sim = float(sims[idx])
+                if sim < threshold:
+                    break
+                vis = self.gallery_index[idx]
+                cand_gender = vis.get('gender')
+                if query_gender and cand_gender and gender_conf >= 0.70:
+                    if cand_gender != query_gender and (vis.get('gender_locked') or vis.get('gender_confidence', 0) >= 0.75):
+                        continue
+                return vis, sim
+
+            return None, 0.0
 
     def search_watchlist(self, emb: np.ndarray, threshold: float = 0.50):
         with self.matrix_lock:
@@ -2252,8 +2356,8 @@ class FaceTrackerEngine:
             
             if not valid_crops:
                 deleted_ids.append(vid)
-            elif len(valid_crops) != len(crops) or valid_crops[0] != photo_b64:
-                new_avatar = valid_crops[0]
+            elif len(valid_crops) != len(crops):
+                new_avatar = photo_b64 if (photo_b64 and self.is_valid_face_b64(photo_b64)) else valid_crops[0]
                 updated_records.append((new_avatar, json.dumps(valid_crops[:8]), vid))
 
         if deleted_ids:
@@ -2321,7 +2425,8 @@ class FaceTrackerEngine:
             return True, "Crop already removed or pruned"
 
         if removed:
-            new_primary = crops[0] if len(crops) > 0 else ''
+            cur_photo = row[1]
+            new_primary = cur_photo if (cur_photo and cur_photo != crop_b64) else (crops[0] if len(crops) > 0 else '')
             new_crops_json = json.dumps(crops)
             cur.execute('UPDATE unique_visitors SET crops_json = ?, photo_b64 = ? WHERE id = ?',
                         (new_crops_json, new_primary, visitor_id))
@@ -2447,7 +2552,7 @@ class FaceTrackerEngine:
         tot_sightings = cur.fetchone()[0]
 
         filtered_crops = [c for c in all_crops if c not in excluded_set][:8]
-        new_primary_photo = filtered_crops[0] if filtered_crops else primary.get('photo_b64', '')
+        new_primary_photo = primary.get('photo_b64') or (filtered_crops[0] if filtered_crops else '')
 
         cur.execute('UPDATE unique_visitors SET crops_json = ?, photo_b64 = ?, total_sightings = ? WHERE id = ?',
                     (json.dumps(filtered_crops), new_primary_photo, tot_sightings, primary_id))
