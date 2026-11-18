@@ -1,26 +1,39 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 
 const formatGridTime = (ts) => {
   if (!ts) return 'Just now';
-  const s = String(ts).trim();
-  if (s.endsWith('Z') || s.includes('+00:00')) {
-    const d = new Date(s);
+  try {
+    const d = new Date(ts);
     if (!isNaN(d.getTime())) {
-      return d.toLocaleTimeString('en-IN', {
+      const now = new Date();
+      const isToday = d.toDateString() === now.toDateString();
+      const timeStr = d.toLocaleTimeString('en-IN', {
         timeZone: 'Asia/Kolkata',
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
         hour12: false
       });
+      if (isToday) return timeStr;
+
+      const yesterday = new Date(now);
+      yesterday.setDate(now.getDate() - 1);
+      if (d.toDateString() === yesterday.toDateString()) {
+        return `Yesterday, ${timeStr}`;
+      }
+      const datePart = d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+      return `${datePart}, ${timeStr}`;
     }
-  }
+  } catch (e) {}
+  const s = String(ts).trim();
   if (s.length >= 19) return s.slice(11, 19);
   return s;
 };
 
 export default function RecentVisitorsGrid({
   visitors = [],
+  feedSource,
+  onToggleFeedSource,
   onBlacklist,
   onRemoveBlacklist,
   onRemoveCrop,
@@ -34,10 +47,29 @@ export default function RecentVisitorsGrid({
   const [gridFrozen, setGridFrozen] = useState(false);
   const [frozenVisitors, setFrozenVisitors] = useState([]);
 
+  // Auto-reset freeze and selection state whenever feed source changes
+  useEffect(() => {
+    setGridFrozen(false);
+    setFrozenVisitors([]);
+    setSelectedMergeIds([]);
+    setTimeFilter('live');
+    setTimeFilteredVisitors(null);
+    setFilterActiveNotice(null);
+  }, [feedSource]);
+
   // Search & Filter controls
+  const [activeCategoryTab, setActiveCategoryTab] = useState('entry'); // 'entry', 'exit', 'all', 'blacklisted'
   const [searchQuery, setSearchQuery] = useState('');
-  const [genderFilter, setGenderFilter] = useState('all'); // 'all', 'male', 'female', 'blacklisted'
+  const [genderFilter, setGenderFilter] = useState('all'); // 'all', 'male', 'female'
   const [displayLimit, setDisplayLimit] = useState(24);
+
+  // Custom Date & Time Filter State
+  const [timeFilter, setTimeFilter] = useState('live'); // 'live', '15m', '1h', '4h', 'today', 'yesterday', 'custom'
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const [timeFilteredVisitors, setTimeFilteredVisitors] = useState(null);
+  const [loadingTimeFilter, setLoadingTimeFilter] = useState(false);
+  const [filterActiveNotice, setFilterActiveNotice] = useState(null);
 
   // Active crop preview per visitor card: { [visitorId]: activeCropIndex }
   const [selectedCropIndex, setSelectedCropIndex] = useState({});
@@ -71,38 +103,172 @@ export default function RecentVisitorsGrid({
     setTimeout(() => setActionNotice(null), 4000);
   };
 
+  // Fetch visitors for specific time filter
+  const fetchTimeFilteredVisitors = useCallback(async (filterVal, startVal, endVal) => {
+    if (filterVal === 'live') {
+      setTimeFilteredVisitors(null);
+      setFilterActiveNotice(null);
+      return;
+    }
+    setLoadingTimeFilter(true);
+    try {
+      let url = `/api/visitors?limit=100`;
+      if (filterVal === 'custom') {
+        if (!startVal) {
+          alert('Please select a start date and time.');
+          setLoadingTimeFilter(false);
+          return;
+        }
+        url += `&start_time=${encodeURIComponent(startVal)}`;
+        if (endVal) url += `&end_time=${encodeURIComponent(endVal)}`;
+        setFilterActiveNotice(`Custom: ${startVal.replace('T', ' ')} to ${endVal ? endVal.replace('T', ' ') : 'Now'}`);
+      } else {
+        url += `&time_range=${encodeURIComponent(filterVal)}`;
+        const labels = {
+          '15m': 'Last 15 Minutes',
+          '1h': 'Last 1 Hour',
+          '4h': 'Last 4 Hours',
+          'today': 'Today (Full Shift)',
+          'yesterday': 'Yesterday',
+          'all': 'All Historical Records'
+        };
+        setFilterActiveNotice(labels[filterVal] || filterVal);
+      }
+      const res = await fetch(url);
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setTimeFilteredVisitors(data);
+        showNotice(`Loaded ${data.length} records for ${filterVal === 'custom' ? 'selected window' : filterVal}`);
+      }
+    } catch (e) {
+      console.error('Time filter error:', e);
+      showNotice('Failed to fetch time-filtered records', true);
+    } finally {
+      setLoadingTimeFilter(false);
+    }
+  }, []);
+
+  const handleTimeFilterChange = (val) => {
+    setTimeFilter(val);
+    if (val !== 'custom') {
+      fetchTimeFilteredVisitors(val, null, null);
+    }
+  };
+
+  const handleApplyCustomTime = () => {
+    fetchTimeFilteredVisitors('custom', customStart, customEnd);
+  };
+
+  const handleResetToLive = () => {
+    setTimeFilter('live');
+    setTimeFilteredVisitors(null);
+    setFilterActiveNotice(null);
+    setCustomStart('');
+    setCustomEnd('');
+  };
+
+  // Current active visitor dataset (switches to timeFilteredVisitors if a time filter is active)
+  const currentVisitorPool = timeFilteredVisitors !== null ? timeFilteredVisitors : (visitors || []);
+
   // Manage Live vs Frozen Visitors
   useEffect(() => {
-    // If not frozen and no active selection/modal, keep visitors updated
     if (!gridFrozen && selectedMergeIds.length === 0 && !similarityWorkspaceOpen && !manualMergeModalOpen) {
-      setFrozenVisitors(visitors);
+      setFrozenVisitors(currentVisitorPool);
     }
-  }, [visitors, gridFrozen, selectedMergeIds.length, similarityWorkspaceOpen, manualMergeModalOpen]);
+  }, [currentVisitorPool, gridFrozen, selectedMergeIds.length, similarityWorkspaceOpen, manualMergeModalOpen]);
 
-  // Current working list of visitors
-  const blacklistedCount = useMemo(() => (visitors || []).filter(v => v.is_blacklisted).length, [visitors]);
+  // Tab counts
+  const entryCount = useMemo(() => {
+    return currentVisitorPool.filter(v => !v.previous_camera && !v.is_multi_camera && (!v.camera_role || v.camera_role === 'entry')).length;
+  }, [currentVisitorPool]);
+
+  const journeyCount = useMemo(() => {
+    return currentVisitorPool.filter(v => v.previous_camera || v.is_multi_camera || v.camera_role === 'exit').length;
+  }, [currentVisitorPool]);
+
+  const allCount = useMemo(() => currentVisitorPool.length, [currentVisitorPool]);
+  const blacklistedCount = useMemo(() => currentVisitorPool.filter(v => v.is_blacklisted).length, [currentVisitorPool]);
+
   const activeVisitorsList = (gridFrozen || selectedMergeIds.length > 0 || similarityWorkspaceOpen || manualMergeModalOpen)
-    ? (frozenVisitors.length > 0 ? frozenVisitors : visitors)
-    : visitors;
+    ? (frozenVisitors.length > 0 ? frozenVisitors : currentVisitorPool)
+    : currentVisitorPool;
 
-  // Filtered and limited visitors
+  // Filtered and limited visitors with smart stable sorting
   const displayedVisitors = useMemo(() => {
-    let list = activeVisitorsList || [];
+    let list = (activeVisitorsList || []).slice();
+
+    // 1. Primary Category Tab Filter & Stable Sort
+    if (activeCategoryTab === 'entry') {
+      // Strictly Entry camera captures
+      list = list.filter(v => !v.previous_camera && !v.is_multi_camera && (!v.camera_role || v.camera_role === 'entry'));
+      
+      // In Live mode, only show latest captured arrivals (within last 30 minutes)
+      if (timeFilter === 'live') {
+        const now = Date.now();
+        const maxLiveAgeMs = 30 * 60 * 1000;
+        list = list.filter(v => {
+          const arrTime = new Date(v.first_seen || v.started_at || v.last_seen || 0).getTime();
+          return (now - arrTime) <= maxLiveAgeMs;
+        });
+      }
+
+      // Sort stably by arrival time (first_seen / started_at descending)
+      list.sort((a, b) => {
+        const ta = new Date(a.first_seen || a.started_at || a.last_seen || 0).getTime();
+        const tb = new Date(b.first_seen || b.started_at || b.last_seen || 0).getTime();
+        return tb - ta;
+      });
+    } else if (activeCategoryTab === 'exit') {
+      // Exit detections and multi-camera journeys
+      list = list.filter(v => v.previous_camera || v.is_multi_camera || v.camera_role === 'exit');
+      
+      // In Live mode, only show latest captured departures (within last 30 minutes)
+      if (timeFilter === 'live') {
+        const now = Date.now();
+        const maxLiveAgeMs = 30 * 60 * 1000;
+        list = list.filter(v => {
+          const depTime = new Date(v.last_seen || 0).getTime();
+          return (now - depTime) <= maxLiveAgeMs;
+        });
+      }
+
+      // Sort by departure time (last_seen descending)
+      list.sort((a, b) => {
+        const ta = new Date(a.last_seen || 0).getTime();
+        const tb = new Date(b.last_seen || 0).getTime();
+        return tb - ta;
+      });
+    } else if (activeCategoryTab === 'blacklisted') {
+      list = list.filter(v => v.is_blacklisted);
+      list.sort((a, b) => (new Date(b.last_seen || 0).getTime()) - (new Date(a.last_seen || 0).getTime()));
+    } else {
+      // 'all'
+      if (timeFilter === 'live') {
+        const now = Date.now();
+        const maxLiveAgeMs = 30 * 60 * 1000;
+        list = list.filter(v => {
+          const t = new Date(v.last_seen || v.first_seen || 0).getTime();
+          return (now - t) <= maxLiveAgeMs;
+        });
+      }
+      list.sort((a, b) => (new Date(b.last_seen || 0).getTime()) - (new Date(a.last_seen || 0).getTime()));
+    }
+
+    // 2. Search Query Filter
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase().trim();
       list = list.filter(v => v.id.toLowerCase().includes(q) || (v.blacklist_reason && v.blacklist_reason.toLowerCase().includes(q)));
     }
+
+    // 3. Secondary Gender Filter
     if (genderFilter === 'male') {
       list = list.filter(v => v.gender === 'male' && !v.is_blacklisted);
     } else if (genderFilter === 'female') {
       list = list.filter(v => v.gender === 'female' && !v.is_blacklisted);
-    } else if (genderFilter === 'multi') {
-      list = list.filter(v => v.is_multi_camera || (v.camera_count && v.camera_count > 1));
-    } else if (genderFilter === 'blacklisted') {
-      list = list.filter(v => v.is_blacklisted);
     }
+
     return list.slice(0, displayLimit);
-  }, [activeVisitorsList, searchQuery, genderFilter, displayLimit]);
+  }, [activeVisitorsList, activeCategoryTab, timeFilter, searchQuery, genderFilter, displayLimit]);
 
   // Toggle profile selection
   const handleToggleSelectProfile = (id, e) => {
@@ -312,16 +478,52 @@ export default function RecentVisitorsGrid({
           </p>
         </div>
 
-        {/* Top Control Bar: Freeze Grid, Search, Filter, Limit */}
+        {/* Top Control Bar: Feed Toggle, Freeze Grid, Search, Filter, Limit */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          {/* Live Grid Freeze / Resume Toggle */}
+          {/* Feed Source Mode Toggle Pill (Demo vs Live) */}
+          {onToggleFeedSource && (
+            <button
+              type="button"
+              onClick={onToggleFeedSource}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '7px',
+                padding: '6px 14px',
+                borderRadius: '8px',
+                fontSize: '12px',
+                fontWeight: '700',
+                cursor: 'pointer',
+                border: feedSource === 'demo' ? '1.5px solid #8b5cf6' : '1.5px solid #10b981',
+                backgroundColor: feedSource === 'demo' ? '#f5f3ff' : '#ecfdf5',
+                color: feedSource === 'demo' ? '#6d28d9' : '#047857',
+                boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+                transition: 'all 0.2s ease'
+              }}
+              title={feedSource === 'demo' ? "Currently showing Demo database records. Click to switch to Live RTSP." : "Currently showing Live database records. Click to switch to Demo."}
+            >
+              <span style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                backgroundColor: feedSource === 'demo' ? '#7c3aed' : '#10b981',
+                boxShadow: feedSource === 'demo' ? '0 0 6px #7c3aed' : '0 0 6px #10b981'
+              }}></span>
+              <span>{feedSource === 'demo' ? '🎬 Demo Mode' : '🟢 Live Feeds'}</span>
+              <span style={{ fontSize: '10px', opacity: 0.7, textDecoration: 'underline', marginLeft: '2px' }}>
+                (Switch)
+              </span>
+            </button>
+          )}
+
+          {/* Real-time Updates Pause / Resume Toggle */}
           <button
             type="button"
             onClick={() => {
               if (!gridFrozen) setFrozenVisitors(visitors);
               setGridFrozen(!gridFrozen);
             }}
-            title={gridFrozen ? "Grid is frozen. New visitors won't shift cards while you work." : "Grid is live updating."}
+            title={gridFrozen ? "Card positions are paused. Click to resume real-time updates." : "Real-time updates active. Click to pause card movement while curating."}
             style={{
               padding: '6px 12px',
               borderRadius: '8px',
@@ -336,7 +538,7 @@ export default function RecentVisitorsGrid({
               gap: '6px'
             }}
           >
-            <span>{gridFrozen ? '⏸️ Grid Frozen (Curating)' : '▶️ Live Grid Active'}</span>
+            <span>{gridFrozen ? '⏸️ Updates Paused' : '▶️ Auto-Updating'}</span>
           </button>
 
           {/* Search Box */}
@@ -355,7 +557,7 @@ export default function RecentVisitorsGrid({
             }}
           />
 
-          {/* Gender / Category Filter */}
+          {/* Gender Filter */}
           <select
             value={genderFilter}
             onChange={(e) => setGenderFilter(e.target.value)}
@@ -370,11 +572,9 @@ export default function RecentVisitorsGrid({
               outline: 'none'
             }}
           >
-            <option value="all">All Visitors</option>
-            <option value="multi">🚶 Multi-Camera Journeys</option>
+            <option value="all">All Genders</option>
             <option value="male">♂ Male Only</option>
             <option value="female">♀ Female Only</option>
-            <option value="blacklisted">⚠️ Blacklisted Only ({blacklistedCount})</option>
           </select>
 
           {/* Display Limit Dropdown */}
@@ -398,8 +598,363 @@ export default function RecentVisitorsGrid({
             <option value={60}>Show 60</option>
             <option value={150}>Show All</option>
           </select>
+
+          {/* Time Window & Date Filter */}
+          <select
+            value={timeFilter}
+            onChange={(e) => handleTimeFilterChange(e.target.value)}
+            title="Filter visitor samples by timeframe to reduce payload and review specific intervals"
+            style={{
+              padding: '6px 10px',
+              borderRadius: '8px',
+              border: timeFilter !== 'live' ? '1.5px solid #0284c7' : '1px solid var(--border-light)',
+              fontSize: '12px',
+              fontWeight: '700',
+              color: timeFilter !== 'live' ? '#0369a1' : 'var(--text-main)',
+              backgroundColor: timeFilter !== 'live' ? '#f0f9ff' : '#ffffff',
+              outline: 'none',
+              cursor: 'pointer'
+            }}
+          >
+            <option value="live">⚡ Live (Latest 30m)</option>
+            <option value="15m">🕒 Last 15 Mins</option>
+            <option value="1h">🕒 Last 1 Hour</option>
+            <option value="4h">🕒 Last 4 Hours</option>
+            <option value="today">📅 Today (Shift)</option>
+            <option value="yesterday">📅 Yesterday</option>
+            <option value="all">🌐 All Records</option>
+            <option value="custom">⚙️ Custom Range...</option>
+          </select>
         </div>
       </div>
+
+      {/* Custom Date & Time Picker Bar */}
+      {timeFilter === 'custom' && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          backgroundColor: '#f8fafc',
+          border: '1.5px solid #bae6fd',
+          padding: '10px 16px',
+          borderRadius: '10px',
+          marginBottom: '16px',
+          flexWrap: 'wrap',
+          boxShadow: '0 2px 5px rgba(2,132,199,0.06)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ fontSize: '13px' }}>⚙️</span>
+            <span style={{ fontSize: '12px', fontWeight: '800', color: '#0369a1' }}>Custom Date & Time Range:</span>
+          </div>
+
+          <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            From:
+            <input
+              type="datetime-local"
+              value={customStart}
+              onChange={(e) => setCustomStart(e.target.value)}
+              style={{
+                padding: '5px 10px',
+                borderRadius: '6px',
+                border: '1px solid #94a3b8',
+                fontSize: '11px',
+                fontWeight: '600',
+                outline: 'none',
+                backgroundColor: '#ffffff'
+              }}
+            />
+          </label>
+
+          <label style={{ fontSize: '11px', fontWeight: '700', color: '#475569', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            To:
+            <input
+              type="datetime-local"
+              value={customEnd}
+              onChange={(e) => setCustomEnd(e.target.value)}
+              style={{
+                padding: '5px 10px',
+                borderRadius: '6px',
+                border: '1px solid #94a3b8',
+                fontSize: '11px',
+                fontWeight: '600',
+                outline: 'none',
+                backgroundColor: '#ffffff'
+              }}
+            />
+          </label>
+
+          <button
+            type="button"
+            onClick={handleApplyCustomTime}
+            disabled={loadingTimeFilter}
+            style={{
+              padding: '6px 14px',
+              backgroundColor: '#0284c7',
+              color: '#ffffff',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              boxShadow: '0 1px 3px rgba(2,132,199,0.3)'
+            }}
+          >
+            <span>{loadingTimeFilter ? '⌛ Loading...' : '🔍 Load Samples'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleResetToLive}
+            style={{
+              padding: '6px 12px',
+              backgroundColor: '#e2e8f0',
+              color: '#334155',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer'
+            }}
+          >
+            Reset to Live
+          </button>
+        </div>
+      )}
+
+      {/* Active Time Filter Notice Banner */}
+      {filterActiveNotice && timeFilter !== 'live' && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          backgroundColor: '#eff6ff',
+          border: '1px solid #bfdbfe',
+          padding: '8px 14px',
+          borderRadius: '8px',
+          marginBottom: '14px',
+          fontSize: '12px',
+          color: '#1e40af',
+          flexWrap: 'wrap',
+          gap: '8px'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span>🕒 <strong>Time Filter Active:</strong> {filterActiveNotice}</span>
+            <span style={{ fontSize: '11px', backgroundColor: '#dbeafe', color: '#1e40af', padding: '2px 8px', borderRadius: '4px', fontWeight: '700' }}>
+              {displayedVisitors.length} profiles loaded
+            </span>
+            <span style={{ fontSize: '11px', color: '#64748b' }}>• Polling paused to reduce network load</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleResetToLive}
+            style={{
+              padding: '4px 10px',
+              backgroundColor: '#2563eb',
+              color: '#ffffff',
+              border: 'none',
+              borderRadius: '6px',
+              fontSize: '11px',
+              fontWeight: '700',
+              cursor: 'pointer'
+            }}
+          >
+            ✕ Reset to Live Updates
+          </button>
+        </div>
+      )}
+
+      {/* Primary Category View Tabs (Entry Camera vs Exit Camera vs All vs Threats) */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        marginBottom: '14px',
+        borderBottom: '1px solid var(--border-light)',
+        paddingBottom: '12px',
+        flexWrap: 'wrap'
+      }}>
+        <button
+          type="button"
+          onClick={() => setActiveCategoryTab('entry')}
+          style={{
+            padding: '8px 18px',
+            borderRadius: '10px',
+            fontSize: '13px',
+            fontWeight: '800',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '8px',
+            border: activeCategoryTab === 'entry' ? '2px solid #0284c7' : '1px solid var(--border-light)',
+            backgroundColor: activeCategoryTab === 'entry' ? '#e0f2fe' : '#ffffff',
+            color: activeCategoryTab === 'entry' ? '#0369a1' : 'var(--text-main)',
+            boxShadow: activeCategoryTab === 'entry' ? '0 2px 6px rgba(2,132,199,0.18)' : 'none',
+            transition: 'all 0.15s ease'
+          }}
+          title="Live face captures from Main Porch Entry Camera (Slot 1)"
+        >
+          <span>🚪 Live Entry Captures</span>
+          <span style={{
+            fontSize: '11px',
+            fontWeight: '700',
+            padding: '2px 8px',
+            borderRadius: '9999px',
+            backgroundColor: activeCategoryTab === 'entry' ? '#0284c7' : '#f1f5f9',
+            color: activeCategoryTab === 'entry' ? '#ffffff' : '#64748b'
+          }}>
+            {entryCount}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveCategoryTab('exit')}
+          style={{
+            padding: '8px 18px',
+            borderRadius: '10px',
+            fontSize: '13px',
+            fontWeight: '800',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '8px',
+            border: activeCategoryTab === 'exit' ? '2px solid #8b5cf6' : '1px solid var(--border-light)',
+            backgroundColor: activeCategoryTab === 'exit' ? '#f5f3ff' : '#ffffff',
+            color: activeCategoryTab === 'exit' ? '#6d28d9' : 'var(--text-main)',
+            boxShadow: activeCategoryTab === 'exit' ? '0 2px 6px rgba(139,92,246,0.18)' : 'none',
+            transition: 'all 0.15s ease'
+          }}
+          title="Departures and multi-camera transits from Main Porch Exit Camera (Slot 2)"
+        >
+          <span>🚶‍♂️ Exit & Journey Records</span>
+          <span style={{
+            fontSize: '11px',
+            fontWeight: '700',
+            padding: '2px 8px',
+            borderRadius: '9999px',
+            backgroundColor: activeCategoryTab === 'exit' ? '#8b5cf6' : '#f1f5f9',
+            color: activeCategoryTab === 'exit' ? '#ffffff' : '#64748b'
+          }}>
+            {journeyCount}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveCategoryTab('all')}
+          style={{
+            padding: '8px 18px',
+            borderRadius: '10px',
+            fontSize: '13px',
+            fontWeight: '700',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '8px',
+            border: activeCategoryTab === 'all' ? '2px solid #64748b' : '1px solid var(--border-light)',
+            backgroundColor: activeCategoryTab === 'all' ? '#f1f5f9' : '#ffffff',
+            color: activeCategoryTab === 'all' ? '#1e293b' : 'var(--text-main)',
+            boxShadow: activeCategoryTab === 'all' ? '0 2px 6px rgba(100,116,139,0.15)' : 'none',
+            transition: 'all 0.15s ease'
+          }}
+          title="All verified unique visitors across all cameras"
+        >
+          <span>👥 All Verified Visitors</span>
+          <span style={{
+            fontSize: '11px',
+            fontWeight: '700',
+            padding: '2px 8px',
+            borderRadius: '9999px',
+            backgroundColor: activeCategoryTab === 'all' ? '#475569' : '#f1f5f9',
+            color: activeCategoryTab === 'all' ? '#ffffff' : '#64748b'
+          }}>
+            {allCount}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveCategoryTab('blacklisted')}
+          style={{
+            padding: '8px 18px',
+            borderRadius: '10px',
+            fontSize: '13px',
+            fontWeight: '700',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '8px',
+            border: activeCategoryTab === 'blacklisted' ? '2px solid #ef4444' : '1px solid var(--border-light)',
+            backgroundColor: activeCategoryTab === 'blacklisted' ? '#fee2e2' : '#ffffff',
+            color: activeCategoryTab === 'blacklisted' ? '#991b1b' : 'var(--text-main)',
+            boxShadow: activeCategoryTab === 'blacklisted' ? '0 2px 6px rgba(239,68,68,0.18)' : 'none',
+            transition: 'all 0.15s ease'
+          }}
+          title="High-priority watchlist alerts and banned individuals"
+        >
+          <span>🚨 Security Threats</span>
+          <span style={{
+            fontSize: '11px',
+            fontWeight: '700',
+            padding: '2px 8px',
+            borderRadius: '9999px',
+            backgroundColor: activeCategoryTab === 'blacklisted' ? '#dc2626' : '#f1f5f9',
+            color: activeCategoryTab === 'blacklisted' ? '#ffffff' : '#64748b'
+          }}>
+            {blacklistedCount}
+          </span>
+        </button>
+      </div>
+
+      {/* Mode Sub-Banner Guide */}
+      {activeCategoryTab === 'entry' && (
+        <div style={{
+          backgroundColor: '#f0fdf4',
+          border: '1px solid #bbf7d0',
+          borderRadius: '8px',
+          padding: '8px 14px',
+          marginBottom: '16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          fontSize: '12px',
+          color: '#166534'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#22c55e', display: 'inline-block' }}></span>
+            <span><strong>Main Porch Entry Live Feed Sync:</strong> Showing arrivals detected at Slot 1 (Gate 01 Main Entry). Sorted in stable arrival order for immediate visual cross-checking against the live video above.</span>
+          </div>
+          <span style={{ fontSize: '11px', color: '#15803d', fontWeight: '700' }}>
+            {displayedVisitors.length} profiles
+          </span>
+        </div>
+      )}
+
+      {activeCategoryTab === 'exit' && (
+        <div style={{
+          backgroundColor: '#faf5ff',
+          border: '1px solid #e9d5ff',
+          borderRadius: '8px',
+          padding: '8px 14px',
+          marginBottom: '16px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          fontSize: '12px',
+          color: '#6b21a8'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#a855f7', display: 'inline-block' }}></span>
+            <span><strong>Exit & Journey Audit Records:</strong> Showing departing visitors recognized at Slot 2 (Main Porch Exit) with full cross-camera journey routing, dwell times, and transit logs.</span>
+          </div>
+          <span style={{ fontSize: '11px', color: '#7e22ce', fontWeight: '700' }}>
+            {displayedVisitors.length} journeys
+          </span>
+        </div>
+      )}
 
       {/* Pinned Selection Dock (Ensures selected profiles never scroll away or disappear) */}
       {selectedMergeIds.length > 0 && (
@@ -476,7 +1031,9 @@ export default function RecentVisitorsGrid({
       }}>
         {(!displayedVisitors || displayedVisitors.length === 0) ? (
           <div style={{ gridColumn: '1 / -1', padding: '40px', textAlign: 'center', color: 'var(--text-dim)', fontSize: '13px' }}>
-            No visitor profiles matching your filter.
+            {timeFilter === 'live'
+              ? 'Waiting for live arrivals at Gate 01 Main Entry... Newly captured faces will appear here in real-time.'
+              : 'No visitor profiles matching your filter.'}
           </div>
         ) : (
           displayedVisitors.map((vis) => {
@@ -580,11 +1137,30 @@ export default function RecentVisitorsGrid({
                               BLACKLISTED
                             </span>
                           )}
+                          {activeCategoryTab === 'entry' && (() => {
+                            const arrTime = new Date(vis.first_seen || vis.started_at || vis.last_seen || 0).getTime();
+                            const isFresh = (Date.now() - arrTime) < 90000;
+                            return isFresh ? (
+                              <span style={{
+                                fontSize: '9px',
+                                fontWeight: '800',
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                backgroundColor: '#dcfce7',
+                                color: '#15803d',
+                                border: '1px solid #86efac'
+                              }}>
+                                ⚡ NEW ARRIVAL
+                              </span>
+                            ) : null;
+                          })()}
                         </div>
                         <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                          {vis.location || 'Gate 01 Main Entry'} • {formatGridTime(vis.started_at || vis.last_seen)}
+                          {activeCategoryTab === 'exit'
+                            ? `Main Porch Exit • ${formatGridTime(vis.last_seen)}`
+                            : `${vis.location || 'Gate 01 Main Entry'} • ${formatGridTime(vis.first_seen || vis.started_at || vis.last_seen)}`}
                         </div>
-                        {vis.previous_camera_name && vis.previous_camera_name !== (vis.camera_name || 'Main Porch Entry') && (
+                        {activeCategoryTab !== 'entry' && vis.previous_camera_name && vis.previous_camera_name !== (vis.camera_name || 'Main Porch Entry') && (
                           <div style={{
                             marginTop: '3px',
                             display: 'inline-flex',
@@ -601,7 +1177,7 @@ export default function RecentVisitorsGrid({
                             <span>From {vis.previous_camera_name}</span>
                           </div>
                         )}
-                        {(vis.is_multi_camera || (vis.camera_count && vis.camera_count > 1)) && (
+                        {activeCategoryTab !== 'entry' && (vis.is_multi_camera || (vis.camera_count && vis.camera_count > 1)) && (
                           <div style={{
                             marginTop: '3px',
                             display: 'inline-flex',

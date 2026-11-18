@@ -40,12 +40,16 @@ export default function App() {
   const [selectedJourneyId, setSelectedJourneyId] = useState(null);
   const [trendRange, setTrendRange] = useState('today');
   const trendRangeRef = useRef('today');
+  const trendCacheRef = useRef({});
+  const kpiCacheRef = useRef({});
   const [trendData, setTrendData] = useState([]);
   const [visitors, setVisitors] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [activeAlert, setActiveAlert] = useState(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
+  const [feedSource, setFeedSource] = useState('live');
+  const [autoEnrollEnabled, setAutoEnrollEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
 
   // Fetch KPI & status data
@@ -53,21 +57,33 @@ export default function App() {
     try {
       const currentRange = trendRangeRef.current || 'today';
       const ts = Date.now();
-      const [kpiRes, camRes, trendRes, visRes, watchRes, alertRes] = await Promise.all([
+      const [kpiRes, camRes, trendRes, visRes, watchRes, alertRes, sourceRes] = await Promise.all([
         fetch(`/api/kpis?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/cameras?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/traffic-trend?range=${encodeURIComponent(currentRange)}&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
-        fetch(`/api/visitors?limit=100&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/visitors?limit=36&time_range=live&_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
         fetch(`/api/watchlist?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
-        fetch(`/api/alerts?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null)
+        fetch(`/api/alerts?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null),
+        fetch(`/api/feed-source?_t=${ts}`, { cache: 'no-store' }).then(r => r.json()).catch(() => null)
       ]);
 
-      if (kpiRes) setKpis(kpiRes);
+      if (sourceRes?.mode) setFeedSource(sourceRes.mode);
+
+      if (kpiRes) {
+        kpiCacheRef.current[currentRange] = kpiRes;
+        setKpis(kpiRes);
+        if (kpiRes.auto_enroll_enabled !== undefined) {
+          setAutoEnrollEnabled(!!kpiRes.auto_enroll_enabled);
+        }
+      }
       if (camRes?.cameras) {
         setCameras(camRes.cameras);
         if (camRes.active) setActiveCamera(camRes.active);
       }
-      if (trendRes) setTrendData(trendRes);
+      if (trendRes) {
+        trendCacheRef.current[currentRange] = trendRes;
+        setTrendData(trendRes);
+      }
       if (visRes) setVisitors(visRes);
       if (watchRes) setWatchlist(watchRes);
       if (alertRes) setAlerts(alertRes);
@@ -210,6 +226,43 @@ export default function App() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
+  const handleToggleFeedSource = async () => {
+    const nextMode = feedSource === 'demo' ? 'live' : 'demo';
+    try {
+      setVisitors([]);
+      const res = await fetch('/api/feed-source', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: nextMode })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setFeedSource(data.mode);
+        await fetchData();
+        window.dispatchEvent(new CustomEvent('feed-source-switched', { detail: { mode: data.mode } }));
+      }
+    } catch (e) {
+      console.error("Toggle feed source error:", e);
+    }
+  };
+
+  const handleToggleAutoEnroll = async () => {
+    const nextState = !autoEnrollEnabled;
+    setAutoEnrollEnabled(nextState);
+    try {
+      const res = await fetch('/api/settings/auto-enroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextState })
+      }).then(r => r.json());
+      if (res && res.auto_enroll_enabled !== undefined) {
+        setAutoEnrollEnabled(!!res.auto_enroll_enabled);
+      }
+    } catch (e) {
+      console.error("Toggle auto-enroll error:", e);
+    }
+  };
+
   const handleSwitchCamera = async (camId) => {
     try {
       const res = await fetch('/api/control', {
@@ -226,12 +279,12 @@ export default function App() {
     }
   };
 
-  const handleAddCamera = async ({ name, location, rtsp }) => {
+  const handleAddCamera = async ({ name, location, rtsp, role }) => {
     try {
       const res = await fetch('/api/cameras/add', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, location, rtsp })
+        body: JSON.stringify({ name, location, rtsp, role })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to add camera');
@@ -246,9 +299,31 @@ export default function App() {
     }
   };
 
+  const handleEditCamera = async ({ id, name, location, rtsp, role }) => {
+    try {
+      const res = await fetch('/api/cameras/edit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, name, location, rtsp, role })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to update camera');
+      await fetchData();
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  };
+
   const handleRemoveCamera = async (camId) => {
-    if (camId === 'main') {
-      alert("Primary Main Porch Entry camera is protected and cannot be deleted.");
+    const camToRemove = cameras.find((c) => c.id === camId);
+    const entryCameras = cameras.filter((c) => c.role === 'entry');
+    if (camToRemove?.role === 'entry' && entryCameras.length <= 1) {
+      alert("Cannot remove camera: At least one camera with 'entry' role must remain active in the system.");
+      return;
+    }
+    if (cameras.length <= 1) {
+      alert("At least one camera must remain active. Cannot delete the only remaining camera.");
       return;
     }
     if (!window.confirm("Are you sure you want to remove this camera checkpoint?")) return;
@@ -260,6 +335,7 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to remove camera');
+      if (data.active) setActiveCamera(data.active);
       await fetchData();
     } catch (e) {
       alert(`Error removing camera: ${e.message}`);
@@ -269,15 +345,26 @@ export default function App() {
   const handleTrendRangeChange = async (newRange) => {
     setTrendRange(newRange);
     trendRangeRef.current = newRange;
+
+    // Instant zero-latency render if cached
+    if (trendCacheRef.current[newRange]) {
+      setTrendData(trendCacheRef.current[newRange]);
+    }
+    if (kpiCacheRef.current[newRange]) {
+      setKpis(kpiCacheRef.current[newRange]);
+    }
+
     try {
       const [trendRes, kpiRes] = await Promise.all([
         fetch(`/api/traffic-trend?range=${encodeURIComponent(newRange)}`).then(r => r.json()).catch(() => null),
         fetch(`/api/kpis?range=${encodeURIComponent(newRange)}`).then(r => r.json()).catch(() => null)
       ]);
       if (Array.isArray(trendRes)) {
+        trendCacheRef.current[newRange] = trendRes;
         setTrendData(trendRes);
       }
       if (kpiRes) {
+        kpiCacheRef.current[newRange] = kpiRes;
         setKpis(kpiRes);
       }
     } catch (e) {
@@ -567,6 +654,71 @@ export default function App() {
 
         {/* Header Right Actions */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+          {/* Feed Source Mode Toggle Pill */}
+          <button
+            type="button"
+            onClick={handleToggleFeedSource}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              padding: '6px 14px',
+              borderRadius: '8px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              border: feedSource === 'demo' ? '1.5px solid #8b5cf6' : '1.5px solid #10b981',
+              backgroundColor: feedSource === 'demo' ? '#f5f3ff' : '#ecfdf5',
+              color: feedSource === 'demo' ? '#6d28d9' : '#047857',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+              transition: 'all 0.2s ease'
+            }}
+            title={feedSource === 'demo' ? "Currently playing Demo Recordings. Click to switch to Live RTSP Feeds." : "Currently streaming Live RTSP Feeds. Click to switch to Demo Recordings."}
+          >
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              backgroundColor: feedSource === 'demo' ? '#7c3aed' : '#10b981',
+              boxShadow: feedSource === 'demo' ? '0 0 6px #7c3aed' : '0 0 6px #10b981'
+            }}></span>
+            <span>{feedSource === 'demo' ? '🎬 Demo Mode (Recordings)' : '🟢 Live Feeds Active'}</span>
+            <span style={{ fontSize: '10px', opacity: 0.7, textDecoration: 'underline', marginLeft: '2px' }}>
+              (Switch)
+            </span>
+          </button>
+
+          {/* Auto-Capture Toggle Pill */}
+          <button
+            type="button"
+            onClick={handleToggleAutoEnroll}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              padding: '6px 14px',
+              borderRadius: '8px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              border: autoEnrollEnabled ? '1.5px solid #10b981' : '1.5px solid #f59e0b',
+              backgroundColor: autoEnrollEnabled ? '#ecfdf5' : '#fffbeb',
+              color: autoEnrollEnabled ? '#047857' : '#b45309',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+              transition: 'all 0.2s ease'
+            }}
+            title={autoEnrollEnabled ? "Auto-capture is active. New visitors are registered in database. Click to pause." : "Auto-capture is paused. DB growth halted; live HUD bounding boxes & exit matching remain active. Click to resume."}
+          >
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              backgroundColor: autoEnrollEnabled ? '#10b981' : '#f59e0b',
+              boxShadow: autoEnrollEnabled ? '0 0 6px #10b981' : '0 0 6px #f59e0b'
+            }}></span>
+            <span>{autoEnrollEnabled ? '📸 Auto-Capture: ON' : '⏸ Auto-Capture: PAUSED'}</span>
+          </button>
+
           {/* Period Selector (Matches PPE Monitor) */}
           <div style={{
             display: 'flex',
@@ -687,6 +839,7 @@ export default function App() {
             cameras={cameras}
             onSwitchCamera={handleSwitchCamera}
             onAddCamera={handleAddCamera}
+            onEditCamera={handleEditCamera}
             onRemoveCamera={handleRemoveCamera}
             fps={kpis?.fps}
             isRtspConnected={kpis?.is_rtsp_connected}
@@ -694,6 +847,8 @@ export default function App() {
             viewMode={viewMode}
             onViewModeChange={setViewMode}
             onDataRefresh={fetchData}
+            autoEnrollEnabled={autoEnrollEnabled}
+            onToggleAutoEnroll={handleToggleAutoEnroll}
           />
           <TrafficTrendChart
             trendData={trendData}
@@ -713,6 +868,7 @@ export default function App() {
             cameras={cameras}
             onSwitchCamera={handleSwitchCamera}
             onAddCamera={handleAddCamera}
+            onEditCamera={handleEditCamera}
             onRemoveCamera={handleRemoveCamera}
             fps={kpis?.fps}
             isRtspConnected={kpis?.is_rtsp_connected}
@@ -720,6 +876,8 @@ export default function App() {
             viewMode={viewMode}
             onViewModeChange={setViewMode}
             onDataRefresh={fetchData}
+            autoEnrollEnabled={autoEnrollEnabled}
+            onToggleAutoEnroll={handleToggleAutoEnroll}
           />
           <TrafficTrendChart
             trendData={trendData}
@@ -731,6 +889,9 @@ export default function App() {
 
       {/* Recent Verified Visitors & Face Captures Gallery (with 1-Click Blacklist, Crop Removal, Smart Similar Merge & Gender Toggle) */}
       <RecentVisitorsGrid
+        key={feedSource || 'live'}
+        feedSource={feedSource}
+        onToggleFeedSource={handleToggleFeedSource}
         visitors={visitors}
         onBlacklist={handleBlacklist}
         onRemoveBlacklist={handleRemoveBlacklist}
@@ -755,6 +916,7 @@ export default function App() {
         visitors={visitors}
         alerts={alerts}
         onOpenJourney={(id) => setSelectedJourneyId(id)}
+        onDataRefresh={fetchData}
       />
     </div>
   );

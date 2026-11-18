@@ -322,14 +322,15 @@ export default function JourneyTimelineModal({ visitorId, isOpen, onClose, onBla
                 {checkpoints.map((cp, idx) => {
                   const isFirst = idx === 0;
                   const isLast = idx === checkpoints.length - 1;
-                  const isExit = cp.camera_id?.includes('exit') || cp.camera_name?.toLowerCase().includes('exit');
+                  const isExit = cp.role === 'exit';
+                  const isEntry = cp.role === 'entry';
 
                   let dotColor = '#3b82f6';
                   let badgeBg = '#eff6ff';
                   let badgeText = '#1d4ed8';
-                  let typeLabel = 'INTERMEDIATE SIGHTING';
+                  let typeLabel = cp.role === 'perimeter' ? 'PERIMETER SIGHTING' : 'INTERMEDIATE SIGHTING';
 
-                  if (isFirst) {
+                  if (isFirst || isEntry) {
                     dotColor = '#10b981';
                     badgeBg = '#ecfdf5';
                     badgeText = '#047857';
