@@ -215,6 +215,16 @@ def init_demo_db():
     conn_demo = sqlite3.connect(DEMO_DB_PATH)
     try:
         cur_d = conn_demo.cursor()
+        cur_d.execute('''
+            CREATE TABLE IF NOT EXISTS cameras (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                location TEXT NOT NULL,
+                rtsp TEXT NOT NULL,
+                created_at TEXT,
+                role TEXT DEFAULT 'entry'
+            )
+        ''')
         cur_d.execute("SELECT COUNT(*) FROM cameras")
         if cur_d.fetchone()[0] == 0:
             cur_l = conn_live.cursor()
