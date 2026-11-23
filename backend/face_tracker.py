@@ -154,7 +154,12 @@ MODELS = ROOT / 'models'
 
 LIVE_DB_PATH = os.environ.get('FACE_TRACKER_DB', str(ROOT / 'face_tracker.db'))
 DEMO_DB_PATH = '/data/face_tracker_demo.db' if os.path.exists('/data') else str(ROOT / 'face_tracker_demo.db')
-RECORDINGS_DIR = Path('/data/recordings') if os.path.exists('/data/recordings') else (ROOT / 'recordings' if (ROOT / 'recordings').exists() else Path(r"d:\Python Projects\recordings"))
+RECORDINGS_DIR = (
+    Path('/data/recordings') if os.path.exists('/data/recordings')
+    else (ROOT / 'data/recordings' if (ROOT / 'data/recordings').exists()
+    else (ROOT / 'recordings' if (ROOT / 'recordings').exists()
+    else Path(r"d:\Python Projects\recordings")))
+)
 
 def get_playlist(path_or_dir):
     if not path_or_dir:
