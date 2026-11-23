@@ -1,4 +1,10 @@
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
+import os
 import sys
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -35,6 +41,7 @@ def get_ist_str(fmt="%I:%M:%S %p IST"):
     return datetime.now(IST).strftime(fmt)
 
 import cv2
+cv2.setNumThreads(4)
 import numpy as np
 
 # ── Paths & Configuration ───────────────────────────────────────────────────
@@ -599,13 +606,13 @@ class CameraStreamPipeline:
                     self.error_msg = f"Connecting to RTSP relay ({self.name})..."
                 cap.release()
 
-                retry_start = time.time()
-                while self.running and self.generation == gen and (time.time() - retry_start) < 3.0:
-                    frame = self._generate_synthetic_frame(time.time() - t0)
+                if self.latest_frame is None or getattr(self, '_offline_frame_set', False) is False:
+                    frame = self._generate_synthetic_frame(0)
                     with self.lock:
                         self.latest_frame = frame
+                        self._offline_frame_set = True
                         self.lock.notify_all()
-                    time.sleep(0.04)
+                time.sleep(4.0)
                 continue
 
             with self.lock:
@@ -618,6 +625,7 @@ class CameraStreamPipeline:
             while self.running and self.generation == gen:
                 ok, frame = cap.read()
                 if not ok:
+                    self._offline_frame_set = False
                     if is_file and playlist:
                         p_idx = (p_idx + 1) % len(playlist)
                         current_source = playlist[p_idx]
@@ -695,7 +703,16 @@ class CameraStreamPipeline:
         now = time.monotonic()
         now_iso = get_ist_iso()
         now_epoch = time.time()
-        faces = self.engine._detect_faces(frame)
+        
+        last_det_ts = getattr(self, '_last_det_ts', 0)
+        should_detect = (now - last_det_ts) >= 0.12 or getattr(self, '_cached_faces', None) is None
+        if should_detect:
+            faces = self.engine._detect_faces(frame)
+            self._cached_faces = faces
+            self._last_det_ts = now
+        else:
+            faces = getattr(self, '_cached_faces', [])
+
         annotated = frame.copy()
 
         matched_track_ids = set()
@@ -1420,8 +1437,14 @@ class CameraStreamPipeline:
             cv2.rectangle(annotated, (bx, tag_y - th - 5), (bx + tw + 10, tag_y + 3), tag_bg, -1)
             cv2.putText(annotated, tag, (bx + 5, tag_y - 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
-        # Fast unblocked JPEG encoding & publishing
-        ok, jpeg = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Ultra-smooth web delivery: downscale to 720p (1280x720) for 70%+ bandwidth drop and instant browser decode
+        h_ann, w_ann = annotated.shape[:2]
+        if w_ann > 1280:
+            display_frame = cv2.resize(annotated, (1280, 720), interpolation=cv2.INTER_LINEAR)
+        else:
+            display_frame = annotated
+
+        ok, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 62])
         if ok:
             with self.lock:
                 self.latest_jpeg = jpeg.tobytes()
@@ -4234,7 +4257,6 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                 pass
 
             seq = -1
-            min_interval = 0.045  # ~21-22 FPS maximum pacing
             last_sent = 0.0
             try:
                 while tracker.running and pipe.running:
@@ -4243,7 +4265,8 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                         if pipe.latest_jpeg is None or pipe.sequence == seq:
                             continue
                         now = time.monotonic()
-                        if (now - last_sent) < min_interval:
+                        # Smooth pacing guard: prevent bursting faster than 30 FPS (33ms) over TCP
+                        if last_sent and (now - last_sent) < 0.033:
                             continue
                         seq = pipe.sequence
                         frame_bytes = pipe.latest_jpeg
