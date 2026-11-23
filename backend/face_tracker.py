@@ -21,9 +21,112 @@ import copy
 import threading
 import queue
 import urllib.parse
+import shutil
+import subprocess
+import ssl
+import socket
+import hashlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+
+# ── FFmpeg Executable Discovery & NVENC GPU Acceleration ─────────────────────
+FFMPEG_BIN = shutil.which('ffmpeg') or (
+    r"C:\Users\Shrishail S K\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
+    if os.path.exists(r"C:\Users\Shrishail S K\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe")
+    else None
+)
+
+def _check_ffmpeg_nvenc():
+    if not FFMPEG_BIN:
+        return False
+    try:
+        res = subprocess.run([FFMPEG_BIN, "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+        return b'h264_nvenc' in res.stdout.lower()
+    except Exception:
+        return False
+
+FFMPEG_NVENC_AVAILABLE = _check_ffmpeg_nvenc()
+
+def get_stream_cert_fingerprint(rtsp_url: str):
+    """Fetches SHA256 TLS cert fingerprint if using RTSPS with self-signed certificate."""
+    try:
+        parsed = urllib.parse.urlparse(rtsp_url)
+        if parsed.scheme.lower() == 'rtsps':
+            host = parsed.hostname
+            port = parsed.port or 322
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=2.0) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                    der = ssock.getpeercert(binary_form=True)
+                    return hashlib.sha256(der).hexdigest().upper()
+    except Exception:
+        pass
+    if '40001' in rtsp_url:
+        return 'B0B711735DC79A4C61ACCB8D3F12AE78A67BBA52702800D3343A7B2BFD18DEE8'
+    elif '40002' in rtsp_url:
+        return '237BB6395EFCE72E2CF49B76D535C4DACA36781E2D56C479F255F82C0AA3C6D3'
+    return None
+
+def sync_camera_to_mediamtx(cam_id: str, rtsp_url: str):
+    """Programmatically register an RTSP camera stream in MediaMTX as a WebRTC endpoint.
+    Uses MediaMTX Control API on port 32197 (server with auth) or 9997 (local)."""
+    import urllib.request
+    import json
+    import base64
+    payload = {
+        'source': rtsp_url,
+        'sourceOnDemand': True,
+        'rtspTransport': 'tcp'
+    }
+    fp = get_stream_cert_fingerprint(rtsp_url)
+    if fp:
+        payload['sourceFingerprint'] = fp
+
+    data = json.dumps(payload).encode('utf-8')
+    auth_b64 = base64.b64encode(b'mtxapi:Xk9vQ2mRt7LwPz4NhB8sYdJ3').decode()
+    for port in [32197, 9997]:
+        headers = {'Content-Type': 'application/json'}
+        if port == 32197:
+            headers['Authorization'] = f'Basic {auth_b64}'
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{port}/v3/config/paths/add/{cam_id}',
+                                         data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status in (200, 201):
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code == 400: # Path exists, replace it
+                try:
+                    req_rep = urllib.request.Request(f'http://127.0.0.1:{port}/v3/config/paths/replace/{cam_id}',
+                                                     data=data, headers=headers)
+                    with urllib.request.urlopen(req_rep, timeout=1.5) as resp_rep:
+                        if resp_rep.status in (200, 201):
+                            return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return False
+
+def remove_camera_from_mediamtx(cam_id: str):
+    """Programmatically delete an RTSP camera stream from MediaMTX."""
+    import urllib.request
+    import base64
+    auth_b64 = base64.b64encode(b'mtxapi:Xk9vQ2mRt7LwPz4NhB8sYdJ3').decode()
+    for port in [32197, 9997]:
+        headers = {}
+        if port == 32197:
+            headers['Authorization'] = f'Basic {auth_b64}'
+        try:
+            req = urllib.request.Request(f'http://127.0.0.1:{port}/v3/config/paths/delete/{cam_id}', headers=headers, method='DELETE')
+            with urllib.request.urlopen(req, timeout=1.5):
+                return True
+        except Exception:
+            continue
+    return False
 
 # ── IST Timezone Configuration (+05:30) ─────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30), name='IST')
@@ -178,6 +281,12 @@ def load_cameras_from_db():
     return cams
 
 CAMERA_SOURCES = load_cameras_from_db()
+# Dynamically register all active cameras in MediaMTX WebRTC engine
+for _cid, _cinfo in CAMERA_SOURCES.items():
+    try:
+        sync_camera_to_mediamtx(_cid, _cinfo['rtsp'])
+    except Exception:
+        pass
 
 MIME_TYPES = {
     '.html': 'text/html; charset=utf-8',
@@ -348,6 +457,7 @@ class CameraStreamPipeline:
         self.last_frame_ts = 0
         self.is_rtsp_connected = False
         self.error_msg = None
+        self.hud_proc = None
         self.active_tracks = {}
         self.recently_closed_tracks = collections.deque(maxlen=25)
         self.next_track_id = 1
@@ -360,6 +470,16 @@ class CameraStreamPipeline:
 
     def stop(self):
         self.running = False
+        if hasattr(self, 'hud_proc') and self.hud_proc:
+            try:
+                self.hud_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.hud_proc.terminate()
+            except Exception:
+                pass
+            self.hud_proc = None
         with self.lock:
             self.lock.notify_all()
 
@@ -370,6 +490,13 @@ class CameraStreamPipeline:
             self.active_tracks.clear()
             if hasattr(self, 'recently_closed_tracks'):
                 self.recently_closed_tracks.clear()
+            if hasattr(self, 'hud_proc') and self.hud_proc:
+                try:
+                    self.hud_proc.stdin.close()
+                    self.hud_proc.terminate()
+                except Exception:
+                    pass
+                self.hud_proc = None
             self.latest_frame = None
             self.latest_jpeg = None
             self.frame_id += 1
@@ -722,12 +849,18 @@ class CameraStreamPipeline:
         for face in faces:
             x, y, w, h = [int(v) for v in face[:4]]
             det_score = float(face[-1])
-            min_det = 0.70 if is_exit_camera else 0.60
-            if det_score < min_det or w < 20 or h < 24:
+            min_det = 0.65 if is_exit_camera else 0.60
+            min_w = 30 if is_exit_camera else 30
+            min_h = 34 if is_exit_camera else 34
+            if det_score < min_det or w < min_w or h < min_h:
                 continue
 
             # False Positive Filter 1: Exit camera sitting guard lap/knees/hands exclusion
             if is_exit_camera and x > 1200 and y > 650:
+                continue
+
+            # False Positive Filter 1B: Ground / Floor tiles & backpack exclusion (rejects floor tiles, carpets, bags)
+            if y > 615 or (y + h) > 705:
                 continue
 
             # False Positive Filter 2: Anatomical 5-point landmark geometry (rejects hands, cuffs, buttons, clothing folds)
@@ -735,7 +868,7 @@ class CameraStreamPipeline:
                 re_x, re_y = face[4], face[5]
                 le_x, le_y = face[6], face[7]
                 eye_dist = math.hypot(le_x - re_x, le_y - re_y)
-                if (eye_dist / max(w, 1)) < 0.12:
+                if (eye_dist / max(w, 1)) < 0.16:
                     continue
 
             cx = x + w / 2.0
@@ -754,6 +887,9 @@ class CameraStreamPipeline:
             if face_crop is not None and face_crop.size > 0:
                 hsv_v = cv2.cvtColor(face_crop, cv2.COLOR_BGR2HSV)[:, :, 2]
                 if np.mean(hsv_v < 40) > 0.42:
+                    continue
+                # Backlight / Doorway / Dark bag texture rejection
+                if np.mean(hsv_v) < 48.0:
                     continue
 
             # Assess frontality & sharpness for crop saving / enrollment (used downstream)
@@ -1444,6 +1580,9 @@ class CameraStreamPipeline:
         else:
             display_frame = annotated
 
+        # Publish AI-annotated frames directly to MediaMTX for 100% frame-locked WebRTC streaming
+        self._push_annotated_to_mediamtx(display_frame)
+
         ok, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 62])
         if ok:
             with self.lock:
@@ -1457,6 +1596,75 @@ class CameraStreamPipeline:
                 self.lock.notify_all()
 
         time.sleep(0.005)
+
+    def _push_annotated_to_mediamtx(self, frame):
+        """Pushes AI-annotated frame (with bboxes, tags, identity pills) directly to MediaMTX via RTSP."""
+        if not FFMPEG_BIN or not getattr(self, 'is_rtsp_connected', False):
+            return
+        h, w = frame.shape[:2]
+        if self.hud_proc is None or self.hud_proc.poll() is not None:
+            is_server = os.environ.get('PORT') in ('31017', '31030') or not os.name == 'nt'
+            target_port = 31554 if is_server else 8554
+            rtsp_target = f"rtsp://127.0.0.1:{target_port}/{self.camera_id}_hud"
+
+            if FFMPEG_NVENC_AVAILABLE:
+                # High-speed hardware GPU encoding on server (GPU 1: RTX 5060 Ti, sub-2ms hardware encode)
+                encoder_cmd = [
+                    "-c:v", "h264_nvenc",
+                    "-gpu", "1",
+                    "-preset", "p1",
+                    "-tune", "ull",
+                    "-pix_fmt", "yuv420p",
+                    "-g", "25",
+                    "-b:v", "2000k",
+                    "-maxrate", "2500k",
+                    "-bufsize", "1000k"
+                ]
+            else:
+                encoder_cmd = [
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-pix_fmt", "yuv420p",
+                    "-g", "25",
+                    "-b:v", "1800k",
+                    "-maxrate", "2200k",
+                    "-bufsize", "900k"
+                ]
+
+            cmd = [
+                FFMPEG_BIN,
+                "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{w}x{h}",
+                "-r", "25",
+                "-i", "pipe:0"
+            ] + encoder_cmd + [
+                "-f", "rtsp",
+                "-rtsp_transport", "tcp",
+                rtsp_target
+            ]
+            try:
+                self.hud_proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=w * h * 3 * 2
+                )
+            except Exception as e:
+                self.hud_proc = None
+                return
+
+        try:
+            self.hud_proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            try:
+                self.hud_proc.terminate()
+            except Exception:
+                pass
+            self.hud_proc = None
 
 
 
@@ -2483,6 +2691,10 @@ class FaceTrackerEngine:
             'role': role
         }
         CAMERA_SOURCES[cam_id] = cam_obj
+        try:
+            sync_camera_to_mediamtx(cam_id, rtsp)
+        except Exception:
+            pass
         # Start new stream pipeline immediately
         try:
             self.pipelines[cam_id] = CameraStreamPipeline(cam_id, name, location, rtsp, self, role=role)
@@ -2528,8 +2740,16 @@ class FaceTrackerEngine:
             pipe.location = new_loc
             pipe.role = new_role
             if rtsp_changed:
+                try:
+                    sync_camera_to_mediamtx(camera_id, new_rtsp)
+                except Exception:
+                    pass
                 pipe.switch_source(new_rtsp)
         else:
+            try:
+                sync_camera_to_mediamtx(camera_id, new_rtsp)
+            except Exception:
+                pass
             try:
                 self.pipelines[camera_id] = CameraStreamPipeline(camera_id, new_name, new_loc, new_rtsp, self, role=new_role)
             except Exception as e:
@@ -2554,6 +2774,10 @@ class FaceTrackerEngine:
         cur.execute('DELETE FROM cameras WHERE id = ?', (camera_id,))
         conn.commit()
         conn.close()
+        try:
+            remove_camera_from_mediamtx(camera_id)
+        except Exception:
+            pass
         if camera_id in self.pipelines:
             self.pipelines[camera_id].stop()
             del self.pipelines[camera_id]
@@ -4176,6 +4400,8 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                 c_copy['is_connected'] = pipe.is_rtsp_connected if pipe else False
                 c_copy['fps'] = pipe.fps if pipe else 0.0
                 c_copy['error_msg'] = pipe.error_msg if pipe else None
+                c_copy['webrtc_path'] = c['id']
+                c_copy['webrtc_port'] = 32089 if (os.name != 'nt' and os.path.exists('/etc/systemd')) else 8889
                 cams.append(c_copy)
             return self.send_json(200, {'cameras': cams, 'active': tracker.active_camera})
 
