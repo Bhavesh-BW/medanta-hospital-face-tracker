@@ -58,7 +58,7 @@ export default function LiveHudFeed({
     }
   }, [cameras]);
 
-  const [hudEnabled, setHudEnabled] = useState(true);
+  const [hudEnabled, setHudEnabled] = useState(false);
   const [streamKey, setStreamKey] = useState(Date.now());
   const [quickBlacklistMode, setQuickBlacklistMode] = useState(false);
   const [clickEffect, setClickEffect] = useState(null);
