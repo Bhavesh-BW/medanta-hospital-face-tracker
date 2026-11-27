@@ -14,6 +14,7 @@ import time
 import math
 import uuid
 import json
+import gzip
 import base64
 import sqlite3
 import collections
@@ -23,6 +24,7 @@ import queue
 import urllib.parse
 import shutil
 import subprocess
+import select
 import ssl
 import socket
 import hashlib
@@ -37,6 +39,17 @@ FFMPEG_BIN = shutil.which('ffmpeg') or (
     else None
 )
 
+def _check_ffmpeg_cuda_hwaccel():
+    if not FFMPEG_BIN:
+        return False
+    try:
+        res = subprocess.run([FFMPEG_BIN, "-hwaccels"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+        return b'cuda' in res.stdout.lower()
+    except Exception:
+        return False
+
+FFMPEG_CUDA_HWACCEL = _check_ffmpeg_cuda_hwaccel()
+
 def _check_ffmpeg_nvenc():
     if not FFMPEG_BIN:
         return False
@@ -47,6 +60,35 @@ def _check_ffmpeg_nvenc():
         return False
 
 FFMPEG_NVENC_AVAILABLE = _check_ffmpeg_nvenc()
+
+def _is_k3s_server():
+    """Return True when running on the Medanta production systemd/k3s host."""
+    return (
+        os.environ.get('PORT') in ('31017', '31030')
+        or (os.name != 'nt' and os.path.exists('/etc/systemd/system/medanta-face-tracker.service'))
+    )
+
+def _detect_nvenc_gpu_id():
+    """Select NVENC GPU index, respecting NVENC_GPU_ID and CUDA_VISIBLE_DEVICES."""
+    explicit = os.environ.get('NVENC_GPU_ID', '').strip()
+    if explicit:
+        return explicit
+    vis_devs = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+    if vis_devs and vis_devs.lower() != 'all':
+        return '0'
+    try:
+        res = subprocess.run(['nvidia-smi', '-L'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+        gpu_lines = [line for line in res.stdout.decode('utf-8', errors='ignore').splitlines() if line.strip().startswith('GPU ')]
+        if len(gpu_lines) >= 2:
+            return '1'
+    except Exception:
+        pass
+    return '0'
+
+DEFAULT_NVENC_GPU_ID = _detect_nvenc_gpu_id()
+MEDIAMTX_RTSP_PORT = int(os.environ.get('MEDIAMTX_RTSP_PORT', '31554' if _is_k3s_server() else '8554'))
+MEDIAMTX_WEBRTC_PORT = int(os.environ.get('MEDIAMTX_WEBRTC_PORT', '32089' if _is_k3s_server() else '8889'))
+MEDIAMTX_API_PORTS = [32197, 9997] if _is_k3s_server() else [9997, 32197]
 
 def get_stream_cert_fingerprint(rtsp_url: str):
     """Fetches SHA256 TLS cert fingerprint if using RTSPS with self-signed certificate."""
@@ -87,7 +129,7 @@ def sync_camera_to_mediamtx(cam_id: str, rtsp_url: str):
 
     data = json.dumps(payload).encode('utf-8')
     auth_b64 = base64.b64encode(b'mtxapi:Xk9vQ2mRt7LwPz4NhB8sYdJ3').decode()
-    for port in [32197, 9997]:
+    for port in MEDIAMTX_API_PORTS:
         headers = {'Content-Type': 'application/json'}
         if port == 32197:
             headers['Authorization'] = f'Basic {auth_b64}'
@@ -116,7 +158,7 @@ def remove_camera_from_mediamtx(cam_id: str):
     import urllib.request
     import base64
     auth_b64 = base64.b64encode(b'mtxapi:Xk9vQ2mRt7LwPz4NhB8sYdJ3').decode()
-    for port in [32197, 9997]:
+    for port in MEDIAMTX_API_PORTS:
         headers = {}
         if port == 32197:
             headers['Authorization'] = f'Basic {auth_b64}'
@@ -464,7 +506,9 @@ class CameraStreamPipeline:
         self.running = True
         self.generation = 0
         self.latest_frame = None
+        self.latest_annotated = None
         self.latest_jpeg = None
+        self._last_mjpeg_ts = 0.0
         self.frame_id = 0
         self.last_processed_frame_id = -1
         self.sequence = 0
@@ -472,7 +516,11 @@ class CameraStreamPipeline:
         self.last_frame_ts = 0
         self.is_rtsp_connected = False
         self.error_msg = None
+        self.proc = None
         self.hud_proc = None
+        self._hud_proc_started_ts = 0.0
+        self._hud_nvenc_fails = 0
+        self._hud_err_file = None
         self.hud_boxes = []
         self.hud_version = 0
         self.active_tracks = {}
@@ -487,16 +535,19 @@ class CameraStreamPipeline:
 
     def stop(self):
         self.running = False
-        if hasattr(self, 'hud_proc') and self.hud_proc:
-            try:
-                self.hud_proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self.hud_proc.terminate()
-            except Exception:
-                pass
-            self.hud_proc = None
+        for attr in ('proc', 'hud_proc'):
+            p = getattr(self, attr, None)
+            if p:
+                try:
+                    if p.stdin:
+                        p.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         with self.lock:
             self.lock.notify_all()
 
@@ -507,14 +558,22 @@ class CameraStreamPipeline:
             self.active_tracks.clear()
             if hasattr(self, 'recently_closed_tracks'):
                 self.recently_closed_tracks.clear()
-            if hasattr(self, 'hud_proc') and self.hud_proc:
-                try:
-                    self.hud_proc.stdin.close()
-                    self.hud_proc.terminate()
-                except Exception:
-                    pass
-                self.hud_proc = None
+            for attr in ('proc', 'hud_proc'):
+                p = getattr(self, attr, None)
+                if p:
+                    try:
+                        if p.stdin:
+                            p.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
+            self._hud_nvenc_fails = 0
             self.latest_frame = None
+            self.latest_annotated = None
             self.latest_jpeg = None
             self.frame_id += 1
             self.last_processed_frame_id = -1
@@ -726,7 +785,6 @@ class CameraStreamPipeline:
         return frame
 
     def _capture_loop(self):
-        t0 = time.time()
         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
         while self.running:
             gen = self.generation
@@ -734,6 +792,107 @@ class CameraStreamPipeline:
             p_idx = 0
             current_source = playlist[p_idx] if playlist else self.rtsp_url
             is_file = (playlist and len(playlist) > 0 and os.path.isfile(playlist[0])) or os.path.isfile(current_source)
+            is_rtsp = (not is_file) and str(current_source).lower().startswith(('rtsp://', 'rtsps://'))
+
+            # Fast GPU/low-latency FFmpeg pipe reader for live RTSP cameras (1280x720@25fps)
+            if is_rtsp and FFMPEG_BIN:
+                use_cuda = FFMPEG_CUDA_HWACCEL
+                for _attempt in range(2):
+                    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error"]
+                    if use_cuda:
+                        cmd.extend(["-hwaccel", "cuda"])
+                    cmd.extend([
+                        "-rtsp_transport", "tcp",
+                        "-timeout", "5000000",
+                        "-fflags", "nobuffer+discardcorrupt",
+                        "-flags", "low_delay",
+                        "-analyzeduration", "500000",
+                        "-probesize", "500000",
+                        "-reorder_queue_size", "1024",
+                        "-max_delay", "500000",
+                        "-i", current_source,
+                        "-f", "rawvideo",
+                        "-pix_fmt", "bgr24",
+                        "-s", "1280x720",
+                        "-r", "25",
+                        "-an", "-sn",
+                        "pipe:1"
+                    ])
+                    proc = None
+                    got_any_frame = False
+                    try:
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            bufsize=1280 * 720 * 3 * 2
+                        )
+                        self.proc = proc
+                        frame_bytes = 1280 * 720 * 3
+
+                        while self.running and self.generation == gen:
+                            if proc.poll() is not None:
+                                break
+                            chunks = []
+                            remaining = frame_bytes
+                            stalled = False
+                            while remaining > 0 and self.running and self.generation == gen:
+                                if os.name != 'nt':
+                                    rlist, _, _ = select.select([proc.stdout], [], [], 4.0)
+                                    if not rlist:
+                                        print(f"[{self.camera_id} FFMPEG WATCHDOG]: Stream stalled for 4.0s, restarting decoder...")
+                                        stalled = True
+                                        break
+                                chunk = proc.stdout.read(min(remaining, 131072))
+                                if not chunk:
+                                    stalled = True
+                                    break
+                                chunks.append(chunk)
+                                remaining -= len(chunk)
+
+                            if stalled or remaining > 0:
+                                break
+
+                            got_any_frame = True
+                            self._offline_frame_set = False
+                            frame = np.frombuffer(b''.join(chunks), dtype=np.uint8).reshape((720, 1280, 3))
+                            with self.lock:
+                                self.is_rtsp_connected = True
+                                self.error_msg = None
+                                self.latest_frame = frame
+                                self.frame_id += 1
+                                self.lock.notify_all()
+                    except Exception as e:
+                        print(f"[{self.camera_id} FFMPEG CAPTURE ERROR (cuda={use_cuda})]:", e)
+                    finally:
+                        if proc:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=0.5)
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                        self.proc = None
+
+                    if got_any_frame or not use_cuda or not self.running or self.generation != gen:
+                        break
+                    use_cuda = False
+
+                with self.lock:
+                    self.is_rtsp_connected = False
+                    self.error_msg = f"Camera Stream Offline ({self.name})"
+
+                if self.latest_frame is None or not getattr(self, '_offline_frame_set', False):
+                    frame = self._generate_synthetic_frame(0)
+                    with self.lock:
+                        self.latest_frame = frame
+                        self._offline_frame_set = True
+                        self.frame_id += 1
+                        self.lock.notify_all()
+                time.sleep(3.0)
+                continue
 
             cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG, [
                 cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000,
@@ -1623,17 +1782,24 @@ class CameraStreamPipeline:
         # Publish AI-annotated frames directly to MediaMTX for 100% frame-locked WebRTC streaming
         self._push_annotated_to_mediamtx(display_frame)
 
-        ok, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 62])
-        if ok:
-            with self.lock:
-                self.latest_jpeg = jpeg.tobytes()
-                self.sequence += 1
-                pub_time = time.monotonic()
-                if self.last_frame_ts:
-                    fps = 1.0 / max(pub_time - self.last_frame_ts, 0.001)
-                    self.fps = round(self.fps * 0.8 + fps * 0.2, 1)
-                self.last_frame_ts = pub_time
-                self.lock.notify_all()
+        now_pub = time.monotonic()
+        need_jpeg = (now_pub - getattr(self, '_last_mjpeg_ts', 0.0)) < 5.0
+        jpeg_bytes = None
+        if need_jpeg:
+            ok, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 62])
+            if ok:
+                jpeg_bytes = jpeg.tobytes()
+
+        with self.lock:
+            self.latest_annotated = display_frame
+            if jpeg_bytes is not None:
+                self.latest_jpeg = jpeg_bytes
+            self.sequence += 1
+            if self.last_frame_ts:
+                fps = 1.0 / max(now_pub - self.last_frame_ts, 0.001)
+                self.fps = round(self.fps * 0.8 + fps * 0.2, 1)
+            self.last_frame_ts = now_pub
+            self.lock.notify_all()
 
         time.sleep(0.005)
 
@@ -1642,16 +1808,21 @@ class CameraStreamPipeline:
         if not FFMPEG_BIN or not getattr(self, 'is_rtsp_connected', False):
             return
         h, w = frame.shape[:2]
-        if self.hud_proc is None or self.hud_proc.poll() is not None:
-            is_server = os.environ.get('PORT') in ('31017', '31030') or not os.name == 'nt'
-            target_port = 31554 if is_server else 8554
-            rtsp_target = f"rtsp://127.0.0.1:{target_port}/{self.camera_id}_hud"
+        if self.hud_proc is not None and self.hud_proc.poll() is not None:
+            lifetime = time.monotonic() - getattr(self, '_hud_proc_started_ts', 0.0)
+            if lifetime < 3.0 and getattr(self, '_hud_nvenc_fails', 0) < 2:
+                self._hud_nvenc_fails = getattr(self, '_hud_nvenc_fails', 0) + 1
+                print(f"[{self.camera_id} HUD PUSH EXITED FAST rc={self.hud_proc.returncode}]; check /tmp/ffmpeg_{self.camera_id}_hud.log")
+            self.hud_proc = None
 
-            if FFMPEG_NVENC_AVAILABLE:
-                # High-speed hardware GPU encoding on server (GPU 1: RTX 5060 Ti, sub-2ms hardware encode)
+        if self.hud_proc is None:
+            rtsp_target = f"rtsp://127.0.0.1:{MEDIAMTX_RTSP_PORT}/{self.camera_id}_hud"
+
+            use_nvenc = FFMPEG_NVENC_AVAILABLE and getattr(self, '_hud_nvenc_fails', 0) < 2
+            if use_nvenc:
                 encoder_cmd = [
                     "-c:v", "h264_nvenc",
-                    "-gpu", "1",
+                    "-gpu", DEFAULT_NVENC_GPU_ID,
                     "-preset", "p1",
                     "-tune", "ull",
                     "-pix_fmt", "yuv420p",
@@ -1675,25 +1846,37 @@ class CameraStreamPipeline:
             cmd = [
                 FFMPEG_BIN,
                 "-y",
+                "-use_wallclock_as_timestamps", "1",
                 "-f", "rawvideo",
                 "-pix_fmt", "bgr24",
                 "-s", f"{w}x{h}",
-                "-r", "25",
                 "-i", "pipe:0"
             ] + encoder_cmd + [
+                "-r", "25",
                 "-f", "rtsp",
                 "-rtsp_transport", "tcp",
                 rtsp_target
             ]
             try:
+                stderr_target = subprocess.DEVNULL
+                if os.name != 'nt':
+                    try:
+                        if getattr(self, '_hud_err_file', None):
+                            self._hud_err_file.close()
+                        self._hud_err_file = open(f"/tmp/ffmpeg_{self.camera_id}_hud.log", "w")
+                        stderr_target = self._hud_err_file
+                    except Exception:
+                        stderr_target = subprocess.DEVNULL
+                self._hud_proc_started_ts = time.monotonic()
                 self.hud_proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=stderr_target,
                     bufsize=w * h * 3 * 2
                 )
             except Exception as e:
+                print(f"[{self.camera_id} HUD PUSH SPAWN ERR]:", e)
                 self.hud_proc = None
                 return
 
@@ -4329,13 +4512,18 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
     def send_json(self, status: int, data: dict or list):
         try:
             payload = json.dumps(data).encode('utf-8')
+            accept_enc = self.headers.get('Accept-Encoding', '') if hasattr(self, 'headers') and self.headers else ''
+            use_gzip = ('gzip' in accept_enc.lower()) and len(payload) > 1024
+            body = gzip.compress(payload, compresslevel=5) if use_gzip else payload
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(payload)))
+            if use_gzip:
+                self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Content-Length', str(len(body)))
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -4450,7 +4638,8 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
                 else:
                     webrtc_path = c['id']
                 c_copy['webrtc_path'] = webrtc_path
-                c_copy['webrtc_port'] = 32089 if (os.name != 'nt' and os.path.exists('/etc/systemd')) else 8889
+                c_copy['webrtc_hud_path'] = f"{c['id']}_hud"
+                c_copy['webrtc_port'] = MEDIAMTX_WEBRTC_PORT
                 cams.append(c_copy)
             return self.send_json(200, {'cameras': cams, 'active': tracker.active_camera})
 
@@ -4554,9 +4743,16 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             cam_id = params.get('camera', [tracker.active_camera])[0]
             pipe = tracker.get_pipeline(cam_id)
             frame_bytes = None
+            ann_frame = None
             if pipe:
                 with pipe.lock:
+                    pipe._last_mjpeg_ts = time.monotonic()
                     frame_bytes = pipe.latest_jpeg
+                    ann_frame = pipe.latest_annotated
+            if not frame_bytes and ann_frame is not None:
+                ok, jpg = cv2.imencode('.jpg', ann_frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                if ok:
+                    frame_bytes = jpg.tobytes()
             if frame_bytes:
                 self.send_response(200)
                 self.send_header('Content-Type', 'image/jpeg')
@@ -4598,6 +4794,7 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             try:
                 while tracker.running and pipe.running:
                     with pipe.lock:
+                        pipe._last_mjpeg_ts = time.monotonic()
                         pipe.lock.wait_for(lambda: pipe.sequence != seq and pipe.latest_jpeg is not None, timeout=0.1)
                         if pipe.latest_jpeg is None or pipe.sequence == seq:
                             continue
@@ -4887,15 +5084,20 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
         try:
             with open(file_path, 'rb') as f:
                 content = f.read()
+            accept_enc = self.headers.get('Accept-Encoding', '') if hasattr(self, 'headers') and self.headers else ''
+            use_gzip = ('gzip' in accept_enc.lower()) and ext in ('.js', '.css', '.html', '.svg', '.json') and len(content) > 1024
+            out_bytes = gzip.compress(content, compresslevel=5) if use_gzip else content
             self.send_response(200)
             self.send_header('Content-Type', mime)
-            self.send_header('Content-Length', str(len(content)))
+            if use_gzip:
+                self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Content-Length', str(len(out_bytes)))
             if ext in ('.js', '.css', '.svg', '.png', '.jpg'):
                 self.send_header('Cache-Control', 'public, max-age=31536000, immutable')
             else:
                 self.send_header('Cache-Control', 'no-cache, must-revalidate')
             self.end_headers()
-            self.wfile.write(content)
+            self.wfile.write(out_bytes)
         except Exception:
             self.send_response(500)
             self.end_headers()

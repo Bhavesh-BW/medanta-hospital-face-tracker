@@ -1,57 +1,52 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { MediaMTXWebRTCReader } from '../utils/webrtcReader';
 
+/** Pure WebRTC player for MediaMTX WHEP endpoints (HUD-burned or raw camera feed). */
 export default function WebRTCPlayer({
   streamPath,
   cameraObj,
   cameraId,
-  hudEnabled = false,
+  hudEnabled = true,
+  refreshKey = 0,
   onClick,
   title = '',
   style = {}
 }) {
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
   const readerRef = useRef(null);
-  const [status, setStatus] = useState('connecting'); // 'connecting' | 'playing' | 'fallback' | 'error'
+  const [status, setStatus] = useState('connecting'); // 'connecting' | 'playing' | 'error'
   const [errorMessage, setErrorMessage] = useState('');
-  const [useFallbackMjpeg, setUseFallbackMjpeg] = useState(false);
 
-  // Derive normalized clean MediaMTX stream path (e.g. 'live/main', 'live/main_exit')
-  const getCleanPath = () => {
-    let p = streamPath || cameraObj?.webrtc_path;
+  const getRawPath = () => {
+    let p = cameraObj?.webrtc_path || streamPath;
     if (!p && cameraObj?.rtsp) {
       if (cameraObj.rtsp.includes('/live/')) {
-        p = 'live/' + cameraObj.rtsp.split('/live/')[1].split('?')[0];
+        p = 'live/' + cameraObj.rtsp.split('/live/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
       } else if (cameraObj.rtsp.includes(':31554/')) {
-        p = cameraObj.rtsp.split(':31554/')[1].split('?')[0];
+        p = cameraObj.rtsp.split(':31554/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
       } else if (cameraObj.rtsp.includes(':8554/')) {
-        p = cameraObj.rtsp.split(':8554/')[1].split('?')[0];
-      }
-    }
-    if (cameraObj?.rtsp && (!p || !p.includes('/'))) {
-      if (cameraObj.rtsp.includes('/live/')) {
-        p = 'live/' + cameraObj.rtsp.split('/live/')[1].split('?')[0];
+        p = cameraObj.rtsp.split(':8554/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
       }
     }
     return p || cameraObj?.id || cameraId;
   };
 
-  const rawPath = getCleanPath();
-  const activeCamId = cameraId || cameraObj?.id || rawPath;
+  const rawPath = getRawPath();
+  const baseId = cameraId || cameraObj?.id || (rawPath ? String(rawPath).replace(/^live\//, '').replace(/_hud$/, '') : '');
+  const targetPath = hudEnabled
+    ? (cameraObj?.webrtc_hud_path || (baseId ? `${baseId}_hud` : ''))
+    : rawPath;
 
-  // 1. Establish Clean WebRTC Video Stream (Native H.264 stream without burning)
   useEffect(() => {
-    if (!rawPath) return;
+    if (!targetPath) return;
 
     setStatus('connecting');
     setErrorMessage('');
-    setUseFallbackMjpeg(false);
 
     const host = window.location.hostname || 'localhost';
-    const isServer = window.location.port === '31017' || window.location.port === '31030' || host === '124.123.89.162';
+    const isServer = ['31017', '31030', '31021'].includes(window.location.port) || host === '124.123.89.162';
     const targetPort = cameraObj?.webrtc_port || (isServer ? 32089 : 8889);
-    const whepUrl = `http://${host}:${targetPort}/${rawPath}/whep`;
+    const whepUrl = `http://${host}:${targetPort}/${targetPath}/whep`;
 
     let active = true;
 
@@ -60,10 +55,8 @@ export default function WebRTCPlayer({
         url: whepUrl,
         onError: (err) => {
           if (!active) return;
-          console.warn(`[WebRTC ${rawPath}] Error:`, err);
-          // If WebRTC fails or endpoint offline, fall back to backend MJPEG stream
-          setUseFallbackMjpeg(true);
-          setStatus('fallback');
+          console.warn(`[WebRTC ${targetPath}] Error:`, err);
+          setStatus('error');
           setErrorMessage(String(err || 'WebRTC stream unavailable'));
         },
         onTrack: (evt) => {
@@ -72,15 +65,13 @@ export default function WebRTCPlayer({
             videoRef.current.srcObject = evt.streams[0];
             setStatus('playing');
             setErrorMessage('');
-            setUseFallbackMjpeg(false);
           }
         }
       });
     } catch (e) {
       if (!active) return;
-      console.error(`[WebRTC ${rawPath}] Init error:`, e);
-      setUseFallbackMjpeg(true);
-      setStatus('fallback');
+      console.error(`[WebRTC ${targetPath}] Initialization error:`, e);
+      setStatus('error');
       setErrorMessage(e.message);
     }
 
@@ -92,166 +83,13 @@ export default function WebRTCPlayer({
         } catch (_) {}
         readerRef.current = null;
       }
-    };
-  }, [rawPath, cameraObj?.webrtc_port]);
-
-  // 2. Client-Side Tactical Canvas Drawing
-  const drawBoxes = useCallback((boxes) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const rect = canvas.getBoundingClientRect();
-    if (canvas.width !== rect.width || canvas.height !== rect.height) {
-      canvas.width = rect.width;
-      canvas.height = rect.height;
-    }
-
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    if (!boxes || boxes.length === 0) return;
-
-    // Calculate aspect ratio fit (account for letterboxing/pillarboxing)
-    const video = videoRef.current;
-    const vw = (video && video.videoWidth) ? video.videoWidth : 1280;
-    const vh = (video && video.videoHeight) ? video.videoHeight : 720;
-    const cw = canvas.width;
-    const ch = canvas.height;
-
-    const videoRatio = vw / vh;
-    const canvasRatio = cw / ch;
-
-    let renderW = cw;
-    let renderH = ch;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    if (canvasRatio > videoRatio) {
-      renderH = ch;
-      renderW = ch * videoRatio;
-      offsetX = (cw - renderW) / 2;
-    } else {
-      renderW = cw;
-      renderH = cw / videoRatio;
-      offsetY = (ch - renderH) / 2;
-    }
-
-    boxes.forEach((b) => {
-      const bx = offsetX + b.x * renderW;
-      const by = offsetY + b.y * renderH;
-      const bw = b.w * renderW;
-      const bh = b.h * renderH;
-
-      const color = b.color || (b.is_blacklisted ? '#dc2626' : (b.is_transit ? '#10b981' : '#38bdf8'));
-      const tag = b.tag || (b.is_blacklisted ? 'BLACKLIST' : (b.is_transit ? 'TRANSIT' : 'DETECTED'));
-      const tagBg = b.tag_bg || (b.is_blacklisted ? '#991b1b' : (b.is_transit ? '#065f46' : 'rgba(15, 23, 42, 0.88)'));
-
-      // Corner Brackets
-      const dLen = Math.max(6, Math.min(bw, bh) * 0.22);
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2.5;
-
-      ctx.beginPath();
-      // Top-Left
-      ctx.moveTo(bx, by + dLen);
-      ctx.lineTo(bx, by);
-      ctx.lineTo(bx + dLen, by);
-
-      // Top-Right
-      ctx.moveTo(bx + bw - dLen, by);
-      ctx.lineTo(bx + bw, by);
-      ctx.lineTo(bx + bw, by + dLen);
-
-      // Bottom-Left
-      ctx.moveTo(bx, by + bh - dLen);
-      ctx.lineTo(bx, by + bh);
-      ctx.lineTo(bx + dLen, by + bh);
-
-      // Bottom-Right
-      ctx.moveTo(bx + bw - dLen, by + bh);
-      ctx.lineTo(bx + bw, by + bh);
-      ctx.lineTo(bx + bw, by + bh - dLen);
-      ctx.stroke();
-
-      // Tag Header Pill
-      if (tag) {
-        ctx.font = 'bold 11px sans-serif';
-        const textMetrics = ctx.measureText(tag);
-        const textW = textMetrics.width;
-        const pillH = 17;
-        const pillY = Math.max(by - pillH - 4, 4);
-
-        ctx.fillStyle = tagBg;
-        if (ctx.roundRect) {
-          ctx.beginPath();
-          ctx.roundRect(bx, pillY, textW + 12, pillH, 4);
-          ctx.fill();
-        } else {
-          ctx.fillRect(bx, pillY, textW + 12, pillH);
-        }
-
-        ctx.fillStyle = '#ffffff';
-        ctx.fillText(tag, bx + 6, pillY + 12);
-      }
-    });
-  }, []);
-
-  // 3. Connect to Real-time HUD SSE Stream When HUD Is Enabled
-  useEffect(() => {
-    if (!hudEnabled || !activeCamId) {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
-      return;
-    }
-
-    let es = null;
-    let pollTimer = null;
-    let active = true;
-
-    // Use SSE for ultra-fast, zero-overhead bbox updates
-    try {
-      es = new EventSource(`/api/stream/hud/sse?camera=${encodeURIComponent(activeCamId)}`);
-      es.onmessage = (evt) => {
-        if (!active) return;
+      if (videoRef.current) {
         try {
-          const data = JSON.parse(evt.data);
-          if (data && Array.isArray(data.boxes)) {
-            drawBoxes(data.boxes);
-          } else if (Array.isArray(data)) {
-            drawBoxes(data);
-          }
+          videoRef.current.srcObject = null;
         } catch (_) {}
-      };
-      es.onerror = () => {
-        // Fallback polling if SSE is not supported or disconnected
-        if (!pollTimer && active) {
-          pollTimer = setInterval(async () => {
-            if (!active) return;
-            try {
-              const res = await fetch(`/api/stream/hud?camera=${encodeURIComponent(activeCamId)}`);
-              const data = await res.json();
-              if (data && Array.isArray(data.boxes)) {
-                drawBoxes(data.boxes);
-              }
-            } catch (_) {}
-          }, 150);
-        }
-      };
-    } catch (_) {}
-
-    return () => {
-      active = false;
-      if (es) {
-        es.close();
-      }
-      if (pollTimer) {
-        clearInterval(pollTimer);
       }
     };
-  }, [hudEnabled, activeCamId, drawBoxes]);
+  }, [targetPath, cameraObj?.webrtc_port, refreshKey]);
 
   return (
     <div
@@ -270,7 +108,7 @@ export default function WebRTCPlayer({
         ...style
       }}
     >
-      {/* 1. Hardware GPU-Decoded Native WebRTC Video Element */}
+      {/* Hardware-Accelerated Native WebRTC Video Element */}
       <video
         ref={videoRef}
         autoPlay
@@ -287,39 +125,8 @@ export default function WebRTCPlayer({
         }}
       />
 
-      {/* 2. Fallback MJPEG Stream (automatically active if WebRTC is offline or establishing) */}
-      {useFallbackMjpeg && (
-        <img
-          src={`/api/stream/feed?camera=${encodeURIComponent(activeCamId)}&hud=0`}
-          alt={title || activeCamId}
-          onLoad={() => setStatus('playing')}
-          onError={() => setStatus('error')}
-          style={{
-            width: '100%',
-            height: '100%',
-            objectFit: 'contain',
-            display: status === 'playing' || status === 'fallback' ? 'block' : 'none',
-            pointerEvents: 'none'
-          }}
-        />
-      )}
-
-      {/* 3. HTML5 Tactical HUD Canvas Overlay (Active only when HUD is ON) */}
-      <canvas
-        ref={canvasRef}
-        style={{
-          position: 'absolute',
-          inset: 0,
-          width: '100%',
-          height: '100%',
-          pointerEvents: 'none',
-          zIndex: 10,
-          display: hudEnabled ? 'block' : 'none'
-        }}
-      />
-
-      {/* 4. Connecting Indicator */}
-      {status === 'connecting' && !useFallbackMjpeg && (
+      {/* Connecting Spinner Indicator */}
+      {status === 'connecting' && (
         <div
           style={{
             position: 'absolute',
@@ -350,12 +157,12 @@ export default function WebRTCPlayer({
             }}
           />
           <span style={{ color: '#94a3b8', fontSize: '12px' }}>
-            Connecting Ultra-Low Latency Stream...
+            {hudEnabled ? 'Connecting AI HUD WebRTC Stream...' : 'Connecting Raw WebRTC Stream...'}
           </span>
         </div>
       )}
 
-      {/* 5. Offline / Error Indicator */}
+      {/* Offline / Auto-Retry Indicator (No heavy MJPEG fallback) */}
       {status === 'error' && (
         <div
           style={{
@@ -378,10 +185,12 @@ export default function WebRTCPlayer({
         >
           <div style={{ fontSize: '28px' }}>📡</div>
           <div style={{ fontSize: '13px', fontWeight: '700', color: '#f87171' }}>
-            Camera Stream Unavailable
+            WebRTC Stream Initializing
           </div>
-          <div style={{ fontSize: '11px', color: '#64748b', maxWidth: '260px' }}>
-            {errorMessage || 'RTSP signal offline; auto-reconnecting'}
+          <div style={{ fontSize: '11px', color: '#64748b', maxWidth: '280px' }}>
+            {errorMessage.includes('404')
+              ? `Waiting for ${targetPath} stream publisher (auto-retrying)...`
+              : errorMessage || 'RTSP signal offline; auto-reconnecting'}
           </div>
         </div>
       )}

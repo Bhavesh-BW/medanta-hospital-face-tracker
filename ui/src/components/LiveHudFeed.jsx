@@ -58,7 +58,7 @@ export default function LiveHudFeed({
     }
   }, [cameras]);
 
-  const [hudEnabled, setHudEnabled] = useState(false);
+  const [hudEnabled, setHudEnabled] = useState(true);
   const [streamKey, setStreamKey] = useState(Date.now());
   const [quickBlacklistMode, setQuickBlacklistMode] = useState(false);
   const [clickEffect, setClickEffect] = useState(null);
@@ -778,6 +778,7 @@ export default function LiveHudFeed({
                 cameraObj={slot1Obj}
                 cameraId={slot1Camera}
                 hudEnabled={hudEnabled}
+                refreshKey={streamKey}
                 title={quickBlacklistMode ? "Click directly on any face in the feed to toggle blacklist" : ""}
               />
               {clickEffect && clickEffect.camId === slot1Camera && (
@@ -984,6 +985,7 @@ export default function LiveHudFeed({
                 cameraObj={slot2Obj}
                 cameraId={slot2Camera}
                 hudEnabled={hudEnabled}
+                refreshKey={streamKey}
                 title={quickBlacklistMode ? "Click directly on any face in the feed to toggle blacklist" : ""}
               />
               {clickEffect && clickEffect.camId === slot2Camera && (
@@ -1199,6 +1201,7 @@ export default function LiveHudFeed({
               cameraObj={focusCamObj}
               cameraId={activeCamera}
               hudEnabled={hudEnabled}
+              refreshKey={streamKey}
               title={quickBlacklistMode ? "Click directly on any face in the feed to toggle blacklist" : ""}
             />
             {clickEffect && clickEffect.camId === activeCamera && (
