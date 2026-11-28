@@ -51,6 +51,7 @@ export default function App() {
   const [feedSource, setFeedSource] = useState('live');
   const [autoEnrollEnabled, setAutoEnrollEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
+  const [periodLoading, setPeriodLoading] = useState(false);
 
   // Fetch KPI & status data
   const fetchData = useCallback(async () => {
@@ -345,6 +346,7 @@ export default function App() {
   const handleTrendRangeChange = async (newRange) => {
     setTrendRange(newRange);
     trendRangeRef.current = newRange;
+    setPeriodLoading(true);
 
     // Instant zero-latency render if cached
     if (trendCacheRef.current[newRange]) {
@@ -355,9 +357,10 @@ export default function App() {
     }
 
     try {
+      const ts = Date.now();
       const [trendRes, kpiRes] = await Promise.all([
-        fetch(`/api/traffic-trend?range=${encodeURIComponent(newRange)}`).then(r => r.json()).catch(() => null),
-        fetch(`/api/kpis?range=${encodeURIComponent(newRange)}`).then(r => r.json()).catch(() => null)
+        fetch(`/api/traffic-trend?range=${encodeURIComponent(newRange)}&_t=${ts}`).then(r => r.json()).catch(() => null),
+        fetch(`/api/kpis?range=${encodeURIComponent(newRange)}&_t=${ts}`).then(r => r.json()).catch(() => null)
       ]);
       if (Array.isArray(trendRes)) {
         trendCacheRef.current[newRange] = trendRes;
@@ -369,6 +372,8 @@ export default function App() {
       }
     } catch (e) {
       console.error("Trend/KPI fetch error:", e);
+    } finally {
+      setTimeout(() => setPeriodLoading(false), 200);
     }
   };
 
@@ -734,13 +739,14 @@ export default function App() {
             <select
               value={trendRange}
               onChange={(e) => handleTrendRangeChange(e.target.value)}
+              disabled={periodLoading}
               style={{
                 border: 'none',
                 backgroundColor: 'transparent',
                 fontSize: '12px',
                 fontWeight: '700',
                 color: '#0284c7',
-                cursor: 'pointer',
+                cursor: periodLoading ? 'wait' : 'pointer',
                 outline: 'none',
                 padding: '2px 0'
               }}
@@ -750,6 +756,19 @@ export default function App() {
               <option value="7d">Past 7 Days</option>
               <option value="30d">Past 30 Days</option>
             </select>
+            {periodLoading && (
+              <span
+                style={{
+                  display: 'inline-block',
+                  width: '12px',
+                  height: '12px',
+                  border: '2px solid rgba(2, 132, 199, 0.25)',
+                  borderTopColor: '#0284c7',
+                  borderRadius: '50%',
+                  animation: 'spin 0.6s linear infinite'
+                }}
+              />
+            )}
           </div>
 
           {/* Sound Toggle */}

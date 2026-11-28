@@ -7,38 +7,39 @@ export default function WebRTCPlayer({
   cameraObj,
   cameraId,
   hudEnabled = true,
-  refreshKey = 0,
   onClick,
   title = '',
   style = {}
 }) {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
-  const [status, setStatus] = useState('connecting'); // 'connecting' | 'playing' | 'error'
+  const [status, setStatus] = useState(hudEnabled ? 'playing' : 'connecting'); // 'connecting' | 'playing' | 'fallback' | 'error'
   const [errorMessage, setErrorMessage] = useState('');
 
-  const getRawPath = () => {
-    let p = cameraObj?.webrtc_path || streamPath;
-    if (!p && cameraObj?.rtsp) {
-      if (cameraObj.rtsp.includes('/live/')) {
-        p = 'live/' + cameraObj.rtsp.split('/live/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
-      } else if (cameraObj.rtsp.includes(':31554/')) {
-        p = cameraObj.rtsp.split(':31554/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
-      } else if (cameraObj.rtsp.includes(':8554/')) {
-        p = cameraObj.rtsp.split(':8554/')[1].split('?')[0].replace(/^\/+|\/+$/g, '');
-      }
-    }
-    return p || cameraObj?.id || cameraId;
-  };
-
-  const rawPath = getRawPath();
-  const baseId = cameraId || cameraObj?.id || (rawPath ? String(rawPath).replace(/^live\//, '').replace(/_hud$/, '') : '');
-  const targetPath = hudEnabled
-    ? (cameraObj?.webrtc_hud_path || (baseId ? `${baseId}_hud` : ''))
-    : rawPath;
+  // Resolve base camera ID for backend MJPEG endpoint
+  const baseCamId = String(
+    cameraId ||
+    cameraObj?.id ||
+    (streamPath ? String(streamPath).replace(/^live\//, '').replace(/_hud$/, '') : '') ||
+    'main'
+  ).replace(/^live\//, '').replace(/_hud$/, '');
 
   useEffect(() => {
-    if (!targetPath) return;
+    // When HUD is enabled, use synchronous frame-locked MJPEG directly from backend.
+    // Frame and bounding box are baked into the same JPEG buffer: 0ms drift / 100% synchronized.
+    if (hudEnabled) {
+      if (readerRef.current) {
+        try { readerRef.current.close(); } catch (_) {}
+        readerRef.current = null;
+      }
+      setStatus('playing');
+      setErrorMessage('');
+      return;
+    }
+
+    // When HUD is OFF, use ultra-low latency direct clean camera WebRTC from MediaMTX
+    const rawPath = streamPath || cameraObj?.webrtc_path || cameraObj?.id || baseCamId;
+    if (!rawPath) return;
 
     setStatus('connecting');
     setErrorMessage('');
@@ -55,8 +56,9 @@ export default function WebRTCPlayer({
         url: whepUrl,
         onError: (err) => {
           if (!active) return;
-          console.warn(`[WebRTC ${targetPath}] Error:`, err);
-          setStatus('error');
+          console.warn(`[WebRTC ${rawPath}] Error:`, err);
+          // If WebRTC fails, seamlessly fall back to backend MJPEG stream
+          setStatus('fallback');
           setErrorMessage(String(err || 'WebRTC stream unavailable'));
         },
         onTrack: (evt) => {
@@ -70,26 +72,19 @@ export default function WebRTCPlayer({
       });
     } catch (e) {
       if (!active) return;
-      console.error(`[WebRTC ${targetPath}] Initialization error:`, e);
-      setStatus('error');
+      console.error(`[WebRTC ${rawPath}] Init error:`, e);
+      setStatus('fallback');
       setErrorMessage(e.message);
     }
 
     return () => {
       active = false;
       if (readerRef.current) {
-        try {
-          readerRef.current.close();
-        } catch (_) {}
+        try { readerRef.current.close(); } catch (_) {}
         readerRef.current = null;
       }
-      if (videoRef.current) {
-        try {
-          videoRef.current.srcObject = null;
-        } catch (_) {}
-      }
     };
-  }, [targetPath, cameraObj?.webrtc_port, refreshKey]);
+  }, [streamPath, cameraObj?.id, cameraObj?.webrtc_path, baseCamId, hudEnabled]);
 
   return (
     <div
@@ -108,22 +103,65 @@ export default function WebRTCPlayer({
         ...style
       }}
     >
-      {/* Hardware-Accelerated Native WebRTC Video Element */}
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted
-        onPlay={() => setStatus('playing')}
-        onLoadedMetadata={() => setStatus('playing')}
-        style={{
-          width: '100%',
-          height: '100%',
-          objectFit: 'contain',
-          display: status === 'playing' ? 'block' : 'none',
-          pointerEvents: 'none'
-        }}
-      />
+      {/* 1. HUD ON Mode: Synchronous Zero-Lag MJPEG Stream (Option 1 - Identical to Port 31030) */}
+      {hudEnabled && (
+        <img
+          key={`hud-${baseCamId}`}
+          src={`/api/stream/feed?camera=${encodeURIComponent(baseCamId)}`}
+          alt={title || baseCamId}
+          onLoad={() => setStatus('playing')}
+          onError={() => {
+            setStatus('error');
+            setErrorMessage('Unable to connect to live AI HUD feed');
+          }}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            display: status === 'error' ? 'none' : 'block',
+            pointerEvents: 'none'
+          }}
+        />
+      )}
+
+      {/* 2. HUD OFF Mode: Ultra-Low Latency Direct Clean WebRTC Feed */}
+      {!hudEnabled && (
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          onPlay={() => setStatus('playing')}
+          onLoadedMetadata={() => setStatus('playing')}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            display: status === 'playing' ? 'block' : 'none',
+            pointerEvents: 'none'
+          }}
+        />
+      )}
+
+      {/* 3. Fallback MJPEG (if WebRTC is offline when HUD is OFF) */}
+      {!hudEnabled && status === 'fallback' && (
+        <img
+          key={`fallback-${baseCamId}`}
+          src={`/api/stream/feed?camera=${encodeURIComponent(baseCamId)}`}
+          alt={title || baseCamId}
+          onError={() => {
+            setStatus('error');
+            setErrorMessage('Camera feed offline');
+          }}
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            display: 'block',
+            pointerEvents: 'none'
+          }}
+        />
+      )}
 
       {/* Connecting Spinner Indicator */}
       {status === 'connecting' && (
@@ -157,12 +195,12 @@ export default function WebRTCPlayer({
             }}
           />
           <span style={{ color: '#94a3b8', fontSize: '12px' }}>
-            {hudEnabled ? 'Connecting AI HUD WebRTC Stream...' : 'Connecting Raw WebRTC Stream...'}
+            {hudEnabled ? 'Connecting Zero-Lag AI HUD Stream...' : 'Connecting Ultra-Low Latency WebRTC...'}
           </span>
         </div>
       )}
 
-      {/* Offline / Auto-Retry Indicator (No heavy MJPEG fallback) */}
+      {/* Offline / Error Indicator */}
       {status === 'error' && (
         <div
           style={{
@@ -177,21 +215,17 @@ export default function WebRTCPlayer({
             alignItems: 'center',
             justifyContent: 'center',
             gap: '8px',
-            color: '#ef4444',
-            padding: '16px',
-            textAlign: 'center',
+            color: '#94a3b8',
+            fontSize: '13px',
+            fontWeight: '500',
             zIndex: 15
           }}
         >
-          <div style={{ fontSize: '28px' }}>📡</div>
-          <div style={{ fontSize: '13px', fontWeight: '700', color: '#f87171' }}>
-            WebRTC Stream Initializing
-          </div>
-          <div style={{ fontSize: '11px', color: '#64748b', maxWidth: '280px' }}>
-            {errorMessage.includes('404')
-              ? `Waiting for ${targetPath} stream publisher (auto-retrying)...`
-              : errorMessage || 'RTSP signal offline; auto-reconnecting'}
-          </div>
+          <div style={{ color: '#ef4444', fontSize: '24px' }}>📡</div>
+          <span style={{ color: '#f87171', fontWeight: '600' }}>Camera Stream Offline</span>
+          <span style={{ fontSize: '11px', color: '#64748b', maxWidth: '80%', textAlign: 'center' }}>
+            {errorMessage || 'Waiting for live camera feed...'}
+          </span>
         </div>
       )}
     </div>

@@ -518,11 +518,6 @@ class CameraStreamPipeline:
         self.error_msg = None
         self.proc = None
         self.hud_proc = None
-        self._hud_proc_started_ts = 0.0
-        self._hud_nvenc_fails = 0
-        self._hud_err_file = None
-        self.hud_boxes = []
-        self.hud_version = 0
         self.active_tracks = {}
         self.recently_closed_tracks = collections.deque(maxlen=25)
         self.next_track_id = 1
@@ -1008,7 +1003,7 @@ class CameraStreamPipeline:
         now_epoch = time.time()
         
         last_det_ts = getattr(self, '_last_det_ts', 0)
-        should_detect = (now - last_det_ts) >= 0.12 or getattr(self, '_cached_faces', None) is None
+        should_detect = (now - last_det_ts) >= 0.08 or getattr(self, '_cached_faces', None) is None
         if should_detect:
             faces = self.engine._detect_faces(frame)
             self._cached_faces = faces
@@ -1690,8 +1685,6 @@ class CameraStreamPipeline:
                             """, p_sig)
 
         # Render Bounding Boxes & HUD from Active Tracks (Zero Lag: only draw currently detected faces)
-        current_hud_boxes = []
-        h_ann, w_ann = annotated.shape[:2]
         for tid, trk in self.active_tracks.items():
             if trk.get('missed', 0) > 0:
                 continue
@@ -1750,27 +1743,6 @@ class CameraStreamPipeline:
             tag_y = max(by - 8, th + 8)
             cv2.rectangle(annotated, (bx, tag_y - th - 5), (bx + tw + 10, tag_y + 3), tag_bg, -1)
             cv2.putText(annotated, tag, (bx + 5, tag_y - 2), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-            # Record normalized bounding box for client-side WebRTC overlay
-            current_hud_boxes.append({
-                'id': tid,
-                'x': round(bx / max(w_ann, 1), 4),
-                'y': round(by / max(h_ann, 1), 4),
-                'w': round(bw / max(w_ann, 1), 4),
-                'h': round(bh / max(h_ann, 1), 4),
-                'tag': tag,
-                'color': f"rgb({color[2]},{color[1]},{color[0]})",
-                'tag_bg': f"rgb({tag_bg[2]},{tag_bg[1]},{tag_bg[0]})",
-                'is_blacklisted': bool(t_blacklisted),
-                'is_transit': bool(t_transit),
-                'visitor_id': t_vid,
-                'gender': t_gender,
-                'age': t_age
-            })
-
-        with self.lock:
-            self.hud_boxes = current_hud_boxes
-            self.hud_version = getattr(self, 'hud_version', 0) + 1
 
         # Ultra-smooth web delivery: downscale to 720p (1280x720) for 70%+ bandwidth drop and instant browser decode
         h_ann, w_ann = annotated.shape[:2]
@@ -4673,68 +4645,6 @@ class FaceTrackerHandler(BaseHTTPRequestHandler):
             finally:
                 if q in tracker.alert_queues:
                     tracker.alert_queues.remove(q)
-            return
-
-        # Real-time HUD Bounding Box Metadata (for WebRTC client-side overlay)
-        if path == '/api/stream/hud':
-            params = urllib.parse.parse_qs(parsed.query)
-            cam_id = params.get('camera', [tracker.active_camera])[0]
-            pipe = tracker.get_pipeline(cam_id)
-            if not pipe:
-                return self.send_json(404, {'error': f'Camera {cam_id} not found'})
-            with pipe.lock:
-                boxes = list(getattr(pipe, 'hud_boxes', []))
-                fps = pipe.fps
-                is_connected = pipe.is_rtsp_connected
-                ver = getattr(pipe, 'hud_version', 0)
-            return self.send_json(200, {
-                'camera': cam_id,
-                'boxes': boxes,
-                'fps': fps,
-                'is_connected': is_connected,
-                'version': ver
-            })
-
-        if path == '/api/stream/hud/sse':
-            params = urllib.parse.parse_qs(parsed.query)
-            cam_id = params.get('camera', [tracker.active_camera])[0]
-            pipe = tracker.get_pipeline(cam_id)
-            if not pipe:
-                return self.send_json(404, {'error': f'Camera {cam_id} not found'})
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
-            self.send_header('Connection', 'keep-alive')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-
-            last_version = -1
-            try:
-                import socket
-                self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.request.settimeout(10.0)
-            except Exception:
-                pass
-
-            try:
-                while tracker.running and pipe.running:
-                    with pipe.lock:
-                        pipe.lock.wait_for(
-                            lambda: (not tracker.running) or (not pipe.running) or getattr(pipe, 'hud_version', 0) != last_version,
-                            timeout=0.05
-                        )
-                        ver = getattr(pipe, 'hud_version', 0)
-                        boxes = list(getattr(pipe, 'hud_boxes', []))
-                    if ver != last_version:
-                        last_version = ver
-                        msg = f"data: {json.dumps({'camera': cam_id, 'boxes': boxes, 'version': ver})}\n\n".encode('utf-8')
-                        self.wfile.write(msg)
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ConnectionError, OSError):
-                return
-            except Exception:
-                return
             return
 
         # Single Frame Snapshot (supports ?camera=<cam_id>)
